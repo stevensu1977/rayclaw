@@ -487,8 +487,21 @@ fn process_anthropic_stream_event(
             {
                 *stop_reason = Some(reason.to_string());
             }
+            // Merge delta usage into existing usage (message_delta typically
+            // only contains output_tokens, so we must not overwrite the
+            // input_tokens already captured from message_start).
             if let Some(u) = v.get("usage") {
-                *usage = usage_from_json(u);
+                if let Some(existing) = usage.as_mut() {
+                    if let Some(out) = u
+                        .get("output_tokens")
+                        .and_then(|n| n.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                    {
+                        existing.output_tokens = out;
+                    }
+                } else {
+                    *usage = usage_from_json(u);
+                }
             }
         }
         "message_start" => {

@@ -13,6 +13,15 @@ pub struct SkillMetadata {
     pub updated_at: Option<String>,
 }
 
+/// A skill with its availability status on the current platform.
+#[derive(Debug, Clone)]
+pub struct SkillInfo {
+    pub metadata: SkillMetadata,
+    pub available: bool,
+    /// Human-readable reason when unavailable (platform mismatch, missing deps, etc.)
+    pub unavailable_reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct SkillFrontmatter {
     name: Option<String>,
@@ -60,6 +69,22 @@ impl SkillManager {
     /// Discover all skills that are available on the current platform and satisfy dependency checks.
     pub fn discover_skills(&self) -> Vec<SkillMetadata> {
         self.discover_skills_internal(false)
+    }
+
+    /// Discover all skills (including unavailable ones) with their availability status.
+    /// Unavailable skills include a human-readable reason (platform mismatch, missing deps).
+    pub fn discover_all_skills(&self) -> Vec<SkillInfo> {
+        self.discover_skills_internal(true)
+            .into_iter()
+            .map(|meta| {
+                let check = self.skill_is_available(&meta);
+                SkillInfo {
+                    available: check.is_ok(),
+                    unavailable_reason: check.err(),
+                    metadata: meta,
+                }
+            })
+            .collect()
     }
 
     fn discover_skills_internal(&self, include_unavailable: bool) -> Vec<SkillMetadata> {
@@ -183,7 +208,6 @@ impl SkillManager {
         output
     }
 
-    #[allow(dead_code)]
     pub fn skills_dir(&self) -> &PathBuf {
         &self.skills_dir
     }

@@ -240,8 +240,8 @@ fn list_instances_linux() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<12} {}", "NAME", "STATUS", "UNIT");
-    println!("{:<20} {:<12} {}", "----", "------", "----");
+    println!("NAME                 STATUS       UNIT");
+    println!("----                 ------       ----");
 
     for entry in &entries {
         let filename = entry
@@ -281,8 +281,8 @@ fn list_instances_macos() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {}", "NAME", "PLIST");
-    println!("{:<20} {}", "----", "-----");
+    println!("NAME                 PLIST");
+    println!("----                 -----");
 
     for entry in &entries {
         let filename = entry

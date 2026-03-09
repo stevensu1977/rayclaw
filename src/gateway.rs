@@ -4,11 +4,24 @@ use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const LINUX_SERVICE_NAME: &str = "rayclaw-gateway.service";
-const MAC_LABEL: &str = "ai.rayclaw.gateway";
-const LOG_STDOUT_FILE: &str = "rayclaw-gateway.log";
-const LOG_STDERR_FILE: &str = "rayclaw-gateway.error.log";
+const DEFAULT_INSTANCE_NAME: &str = "default";
 const DEFAULT_LOG_LINES: usize = 200;
+
+fn linux_service_name(name: &str) -> String {
+    format!("rayclaw-gateway-{name}.service")
+}
+
+fn mac_label(name: &str) -> String {
+    format!("ai.rayclaw.gateway.{name}")
+}
+
+fn log_stdout_file(name: &str) -> String {
+    format!("rayclaw-gateway-{name}.log")
+}
+
+fn log_stderr_file(name: &str) -> String {
+    format!("rayclaw-gateway-{name}.error.log")
+}
 
 #[derive(Debug, Clone)]
 struct ServiceContext {
@@ -18,25 +31,76 @@ struct ServiceContext {
     runtime_logs_dir: PathBuf,
 }
 
+/// Validate an instance name: alphanumeric + hyphens, 1-64 chars.
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(anyhow!(
+            "Instance name must be 1-64 characters, got {}",
+            name.len()
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(anyhow!(
+            "Instance name must contain only alphanumeric characters and hyphens: '{name}'"
+        ));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(anyhow!(
+            "Instance name must not start or end with a hyphen: '{name}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Extract `--name <NAME>` from args, returning (name, remaining_args).
+fn extract_name(args: &[String]) -> Result<(String, Vec<String>)> {
+    let mut name = DEFAULT_INSTANCE_NAME.to_string();
+    let mut remaining = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--name" {
+            name = iter
+                .next()
+                .ok_or_else(|| anyhow!("--name requires a value"))?
+                .clone();
+        } else {
+            remaining.push(arg.clone());
+        }
+    }
+    validate_name(&name)?;
+    Ok((name, remaining))
+}
+
 pub fn handle_gateway_cli(args: &[String]) -> Result<()> {
     let Some(action) = args.first().map(|s| s.as_str()) else {
         print_gateway_help();
         return Ok(());
     };
 
+    // `list` and `help` don't need --name parsing
     match action {
-        "install" => install(),
-        "uninstall" => uninstall(),
-        "start" => start(),
-        "stop" => stop(),
-        "status" => status(),
-        "logs" => logs(args.get(1).map(|s| s.as_str())),
+        "list" => return list_instances(),
         "help" | "--help" | "-h" => {
             print_gateway_help();
-            Ok(())
+            return Ok(());
         }
+        _ => {}
+    }
+
+    let (name, rest) = extract_name(&args[1..])?;
+
+    match action {
+        "install" => install(&name),
+        "uninstall" => uninstall(&name),
+        "start" => start(&name),
+        "stop" => stop(&name),
+        "status" => status(&name),
+        "logs" => logs(&name, rest.first().map(|s| s.as_str())),
         _ => Err(anyhow!(
-            "Unknown gateway action: {}. Use: gateway <install|uninstall|start|stop|status|logs>",
+            "Unknown gateway action: {}. Run: rayclaw gateway help",
             action
         )),
     }
@@ -44,10 +108,10 @@ pub fn handle_gateway_cli(args: &[String]) -> Result<()> {
 
 pub fn print_gateway_help() {
     println!(
-        r#"Gateway service management
+        r#"Gateway service management (multi-instance)
 
 USAGE:
-    rayclaw gateway <ACTION>
+    rayclaw gateway <ACTION> [--name <NAME>]
 
 ACTIONS:
     install      Install and enable persistent gateway service
@@ -56,17 +120,27 @@ ACTIONS:
     stop         Stop gateway service
     status       Show gateway service status
     logs [N]     Show last N lines of gateway logs (default: 200)
+    list         List all installed gateway instances
     help         Show this message
+
+OPTIONS:
+    --name <NAME>   Instance name (default: "default")
+
+EXAMPLES:
+    rayclaw gateway install                  Install with name "default"
+    rayclaw gateway install --name bot-cn    Install as "bot-cn"
+    rayclaw gateway status --name bot-cn     Check status of "bot-cn"
+    rayclaw gateway list                     Show all instances
 "#
     );
 }
 
-fn install() -> Result<()> {
+fn install(name: &str) -> Result<()> {
     let ctx = build_context()?;
     if cfg!(target_os = "macos") {
-        install_macos(&ctx)
+        install_macos(&ctx, name)
     } else if cfg!(target_os = "linux") {
-        install_linux(&ctx)
+        install_linux(&ctx, name)
     } else {
         Err(anyhow!(
             "Gateway service is only supported on macOS and Linux"
@@ -74,11 +148,11 @@ fn install() -> Result<()> {
     }
 }
 
-fn uninstall() -> Result<()> {
+fn uninstall(name: &str) -> Result<()> {
     if cfg!(target_os = "macos") {
-        uninstall_macos()
+        uninstall_macos(name)
     } else if cfg!(target_os = "linux") {
-        uninstall_linux()
+        uninstall_linux(name)
     } else {
         Err(anyhow!(
             "Gateway service is only supported on macOS and Linux"
@@ -86,11 +160,11 @@ fn uninstall() -> Result<()> {
     }
 }
 
-fn start() -> Result<()> {
+fn start(name: &str) -> Result<()> {
     if cfg!(target_os = "macos") {
-        start_macos()
+        start_macos(name)
     } else if cfg!(target_os = "linux") {
-        start_linux()
+        start_linux(name)
     } else {
         Err(anyhow!(
             "Gateway service is only supported on macOS and Linux"
@@ -98,11 +172,11 @@ fn start() -> Result<()> {
     }
 }
 
-fn stop() -> Result<()> {
+fn stop(name: &str) -> Result<()> {
     if cfg!(target_os = "macos") {
-        stop_macos()
+        stop_macos(name)
     } else if cfg!(target_os = "linux") {
-        stop_linux()
+        stop_linux(name)
     } else {
         Err(anyhow!(
             "Gateway service is only supported on macOS and Linux"
@@ -110,11 +184,11 @@ fn stop() -> Result<()> {
     }
 }
 
-fn status() -> Result<()> {
+fn status(name: &str) -> Result<()> {
     if cfg!(target_os = "macos") {
-        status_macos()
+        status_macos(name)
     } else if cfg!(target_os = "linux") {
-        status_linux()
+        status_linux(name)
     } else {
         Err(anyhow!(
             "Gateway service is only supported on macOS and Linux"
@@ -122,15 +196,110 @@ fn status() -> Result<()> {
     }
 }
 
-fn logs(lines_arg: Option<&str>) -> Result<()> {
+fn logs(name: &str, lines_arg: Option<&str>) -> Result<()> {
     let lines = parse_log_lines(lines_arg)?;
     let ctx = build_context()?;
-    println!("== gateway logs: {} ==", ctx.runtime_logs_dir.display());
+    println!(
+        "== gateway logs [{name}]: {} ==",
+        ctx.runtime_logs_dir.display()
+    );
     let tailed = logging::read_last_lines_from_logs(&ctx.runtime_logs_dir, lines)?;
     if tailed.is_empty() {
         println!("(no log lines found)");
     } else {
         println!("{}", tailed.join("\n"));
+    }
+    Ok(())
+}
+
+fn list_instances() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        list_instances_macos()
+    } else if cfg!(target_os = "linux") {
+        list_instances_linux()
+    } else {
+        Err(anyhow!(
+            "Gateway service is only supported on macOS and Linux"
+        ))
+    }
+}
+
+fn list_instances_linux() -> Result<()> {
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    let unit_dir = PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user");
+
+    let pattern = unit_dir.join("rayclaw-gateway-*.service");
+    let pattern_str = pattern.to_string_lossy();
+
+    let entries: Vec<_> = glob::glob(&pattern_str)
+        .map(|paths| paths.filter_map(|p| p.ok()).collect())
+        .unwrap_or_default();
+
+    if entries.is_empty() {
+        println!("No gateway instances installed.");
+        return Ok(());
+    }
+
+    println!("{:<20} {:<12} {}", "NAME", "STATUS", "UNIT");
+    println!("{:<20} {:<12} {}", "----", "------", "----");
+
+    for entry in &entries {
+        let filename = entry
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        // rayclaw-gateway-<name>.service → extract <name>
+        let name = filename
+            .strip_prefix("rayclaw-gateway-")
+            .and_then(|s| s.strip_suffix(".service"))
+            .unwrap_or(&filename);
+
+        let service = linux_service_name(name);
+        let status = match run_command("systemctl", &["--user", "is-active", &service]) {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            Err(_) => "unknown".to_string(),
+        };
+
+        println!("{:<20} {:<12} {}", name, status, entry.display());
+    }
+    Ok(())
+}
+
+fn list_instances_macos() -> Result<()> {
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    let agents_dir = PathBuf::from(home).join("Library").join("LaunchAgents");
+    let pattern = agents_dir.join("ai.rayclaw.gateway.*.plist");
+    let pattern_str = pattern.to_string_lossy();
+
+    let entries: Vec<_> = glob::glob(&pattern_str)
+        .map(|paths| paths.filter_map(|p| p.ok()).collect())
+        .unwrap_or_default();
+
+    if entries.is_empty() {
+        println!("No gateway instances installed.");
+        return Ok(());
+    }
+
+    println!("{:<20} {}", "NAME", "PLIST");
+    println!("{:<20} {}", "----", "-----");
+
+    for entry in &entries {
+        let filename = entry
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        // ai.rayclaw.gateway.<name>.plist → extract <name>
+        let name = filename
+            .strip_prefix("ai.rayclaw.gateway.")
+            .and_then(|s| s.strip_suffix(".plist"))
+            .unwrap_or(&filename);
+
+        println!("{:<20} {}", name, entry.display());
     }
     Ok(())
 }
@@ -213,23 +382,28 @@ fn ensure_success(output: std::process::Output, cmd: &str, args: &[&str]) -> Res
     ))
 }
 
-fn linux_unit_path() -> Result<PathBuf> {
+// ── Linux (systemd --user) ──────────────────────────────────────────────
+
+fn linux_unit_path(name: &str) -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home)
         .join(".config")
         .join("systemd")
         .join("user")
-        .join(LINUX_SERVICE_NAME))
+        .join(linux_service_name(name)))
 }
 
-fn render_linux_unit(ctx: &ServiceContext) -> String {
+fn render_linux_unit(ctx: &ServiceContext, name: &str) -> String {
     let mut unit = String::new();
     unit.push_str("[Unit]\n");
-    unit.push_str("Description=RayClaw Gateway Service\n");
+    unit.push_str(&format!("Description=RayClaw Gateway [{name}]\n"));
     unit.push_str("After=network.target\n\n");
     unit.push_str("[Service]\n");
     unit.push_str("Type=simple\n");
-    unit.push_str(&format!("WorkingDirectory={}\n", ctx.working_dir.display()));
+    unit.push_str(&format!(
+        "WorkingDirectory={}\n",
+        ctx.working_dir.display()
+    ));
     unit.push_str(&format!("ExecStart={} start\n", ctx.exe_path.display()));
     unit.push_str("Environment=RAYCLAW_GATEWAY=1\n");
     if let Some(config_path) = &ctx.config_path {
@@ -245,93 +419,91 @@ fn render_linux_unit(ctx: &ServiceContext) -> String {
     unit
 }
 
-fn install_linux(ctx: &ServiceContext) -> Result<()> {
-    let unit_path = linux_unit_path()?;
+fn install_linux(ctx: &ServiceContext, name: &str) -> Result<()> {
+    let unit_path = linux_unit_path(name)?;
     let unit_dir = unit_path
         .parent()
         .ok_or_else(|| anyhow!("Invalid unit path"))?;
     std::fs::create_dir_all(unit_dir)
         .with_context(|| format!("Failed to create {}", unit_dir.display()))?;
-    std::fs::write(&unit_path, render_linux_unit(ctx))
+    std::fs::write(&unit_path, render_linux_unit(ctx, name))
         .with_context(|| format!("Failed to write {}", unit_path.display()))?;
 
+    let service = linux_service_name(name);
     ensure_success(
         run_command("systemctl", &["--user", "daemon-reload"])?,
         "systemctl",
         &["--user", "daemon-reload"],
     )?;
     ensure_success(
-        run_command(
-            "systemctl",
-            &["--user", "enable", "--now", LINUX_SERVICE_NAME],
-        )?,
+        run_command("systemctl", &["--user", "enable", "--now", &service])?,
         "systemctl",
-        &["--user", "enable", "--now", LINUX_SERVICE_NAME],
+        &["--user", "enable", "--now", &service],
     )?;
 
     println!(
-        "Installed and started gateway service: {}",
+        "Installed and started gateway [{name}]: {}",
         unit_path.display()
     );
     Ok(())
 }
 
-fn uninstall_linux() -> Result<()> {
-    let _ = run_command(
-        "systemctl",
-        &["--user", "disable", "--now", LINUX_SERVICE_NAME],
-    );
+fn uninstall_linux(name: &str) -> Result<()> {
+    let service = linux_service_name(name);
+    let _ = run_command("systemctl", &["--user", "disable", "--now", &service]);
     let _ = run_command("systemctl", &["--user", "daemon-reload"]);
 
-    let unit_path = linux_unit_path()?;
+    let unit_path = linux_unit_path(name)?;
     if unit_path.exists() {
         std::fs::remove_file(&unit_path)
             .with_context(|| format!("Failed to remove {}", unit_path.display()))?;
     }
     let _ = run_command("systemctl", &["--user", "daemon-reload"]);
-    println!("Uninstalled gateway service");
+    println!("Uninstalled gateway [{name}]");
     Ok(())
 }
 
-fn start_linux() -> Result<()> {
+fn start_linux(name: &str) -> Result<()> {
+    let service = linux_service_name(name);
     ensure_success(
-        run_command("systemctl", &["--user", "start", LINUX_SERVICE_NAME])?,
+        run_command("systemctl", &["--user", "start", &service])?,
         "systemctl",
-        &["--user", "start", LINUX_SERVICE_NAME],
+        &["--user", "start", &service],
     )?;
-    println!("Gateway service started");
+    println!("Gateway [{name}] started");
     Ok(())
 }
 
-fn stop_linux() -> Result<()> {
+fn stop_linux(name: &str) -> Result<()> {
+    let service = linux_service_name(name);
     ensure_success(
-        run_command("systemctl", &["--user", "stop", LINUX_SERVICE_NAME])?,
+        run_command("systemctl", &["--user", "stop", &service])?,
         "systemctl",
-        &["--user", "stop", LINUX_SERVICE_NAME],
+        &["--user", "stop", &service],
     )?;
-    println!("Gateway service stopped");
+    println!("Gateway [{name}] stopped");
     Ok(())
 }
 
-fn status_linux() -> Result<()> {
-    let output = run_command(
-        "systemctl",
-        &["--user", "status", LINUX_SERVICE_NAME, "--no-pager"],
-    )?;
+fn status_linux(name: &str) -> Result<()> {
+    let service = linux_service_name(name);
+    let output = run_command("systemctl", &["--user", "status", &service, "--no-pager"])?;
     print!("{}", String::from_utf8_lossy(&output.stdout));
     if output.status.success() {
         Ok(())
     } else {
-        Err(anyhow!("Gateway service is not running"))
+        Err(anyhow!("Gateway [{name}] is not running"))
     }
 }
 
-fn mac_plist_path() -> Result<PathBuf> {
+// ── macOS (launchctl) ───────────────────────────────────────────────────
+
+fn mac_plist_path(name: &str) -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home)
         .join("Library")
         .join("LaunchAgents")
-        .join(format!("{MAC_LABEL}.plist")))
+        .join(format!("{}.plist", mac_label(name))))
 }
 
 fn current_uid() -> Result<String> {
@@ -347,17 +519,24 @@ fn current_uid() -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn render_macos_plist(ctx: &ServiceContext) -> String {
+fn render_macos_plist(ctx: &ServiceContext, name: &str) -> String {
+    let label = mac_label(name);
+    let stdout_file = log_stdout_file(name);
+    let stderr_file = log_stderr_file(name);
+
     let mut items = vec![
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_string(),
         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">".to_string(),
         "<plist version=\"1.0\">".to_string(),
         "<dict>".to_string(),
         "  <key>Label</key>".to_string(),
-        format!("  <string>{MAC_LABEL}</string>"),
+        format!("  <string>{label}</string>"),
         "  <key>ProgramArguments</key>".to_string(),
         "  <array>".to_string(),
-        format!("    <string>{}</string>", xml_escape(&ctx.exe_path.to_string_lossy())),
+        format!(
+            "    <string>{}</string>",
+            xml_escape(&ctx.exe_path.to_string_lossy())
+        ),
         "    <string>start</string>".to_string(),
         "  </array>".to_string(),
         "  <key>WorkingDirectory</key>".to_string(),
@@ -372,12 +551,12 @@ fn render_macos_plist(ctx: &ServiceContext) -> String {
         "  <key>StandardOutPath</key>".to_string(),
         format!(
             "  <string>{}</string>",
-            xml_escape(&ctx.working_dir.join(LOG_STDOUT_FILE).to_string_lossy())
+            xml_escape(&ctx.working_dir.join(&stdout_file).to_string_lossy())
         ),
         "  <key>StandardErrorPath</key>".to_string(),
         format!(
             "  <string>{}</string>",
-            xml_escape(&ctx.working_dir.join(LOG_STDERR_FILE).to_string_lossy())
+            xml_escape(&ctx.working_dir.join(&stderr_file).to_string_lossy())
         ),
     ];
 
@@ -408,47 +587,47 @@ fn xml_escape(input: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn mac_target_label() -> Result<String> {
+fn mac_target_label(name: &str) -> Result<String> {
     let uid = current_uid()?;
-    Ok(format!("gui/{uid}/{MAC_LABEL}"))
+    Ok(format!("gui/{uid}/{}", mac_label(name)))
 }
 
-fn install_macos(ctx: &ServiceContext) -> Result<()> {
-    let plist_path = mac_plist_path()?;
+fn install_macos(ctx: &ServiceContext, name: &str) -> Result<()> {
+    let plist_path = mac_plist_path(name)?;
     let launch_agents = plist_path
         .parent()
         .ok_or_else(|| anyhow!("Invalid plist path"))?;
     std::fs::create_dir_all(launch_agents)
         .with_context(|| format!("Failed to create {}", launch_agents.display()))?;
-    std::fs::write(&plist_path, render_macos_plist(ctx))
+    std::fs::write(&plist_path, render_macos_plist(ctx, name))
         .with_context(|| format!("Failed to write {}", plist_path.display()))?;
 
-    let _ = stop_macos();
-    start_macos()?;
+    let _ = stop_macos(name);
+    start_macos(name)?;
     println!(
-        "Installed and started gateway service: {}",
+        "Installed and started gateway [{name}]: {}",
         plist_path.display()
     );
     Ok(())
 }
 
-fn uninstall_macos() -> Result<()> {
-    let _ = stop_macos();
-    let plist_path = mac_plist_path()?;
+fn uninstall_macos(name: &str) -> Result<()> {
+    let _ = stop_macos(name);
+    let plist_path = mac_plist_path(name)?;
     if plist_path.exists() {
         std::fs::remove_file(&plist_path)
             .with_context(|| format!("Failed to remove {}", plist_path.display()))?;
     }
-    println!("Uninstalled gateway service");
+    println!("Uninstalled gateway [{name}]");
     Ok(())
 }
 
-fn start_macos() -> Result<()> {
-    let target = mac_target_label()?;
-    let plist_path = mac_plist_path()?;
+fn start_macos(name: &str) -> Result<()> {
+    let target = mac_target_label(name)?;
+    let plist_path = mac_plist_path(name)?;
     if !plist_path.exists() {
         return Err(anyhow!(
-            "Service not installed. Run: rayclaw gateway install"
+            "Service not installed. Run: rayclaw gateway install --name {name}"
         ));
     }
     let gui_target = format!("gui/{}", current_uid()?);
@@ -471,15 +650,15 @@ fn start_macos() -> Result<()> {
         "launchctl",
         &["kickstart", "-k", &target],
     )?;
-    println!("Gateway service started");
+    println!("Gateway [{name}] started");
     Ok(())
 }
 
-fn stop_macos() -> Result<()> {
-    let target = mac_target_label()?;
+fn stop_macos(name: &str) -> Result<()> {
+    let target = mac_target_label(name)?;
     let output = run_command("launchctl", &["bootout", &target])?;
     if output.status.success() {
-        println!("Gateway service stopped");
+        println!("Gateway [{name}] stopped");
         return Ok(());
     }
 
@@ -497,14 +676,14 @@ fn stop_macos() -> Result<()> {
     ))
 }
 
-fn status_macos() -> Result<()> {
-    let target = mac_target_label()?;
+fn status_macos(name: &str) -> Result<()> {
+    let target = mac_target_label(name)?;
     let output = run_command("launchctl", &["print", &target])?;
     print!("{}", String::from_utf8_lossy(&output.stdout));
     if output.status.success() {
         Ok(())
     } else {
-        Err(anyhow!("Gateway service is not running"))
+        Err(anyhow!("Gateway [{name}] is not running"))
     }
 }
 
@@ -520,7 +699,72 @@ mod tests {
     }
 
     #[test]
-    fn test_render_linux_unit_contains_start_and_restart() {
+    fn test_validate_name_valid() {
+        assert!(validate_name("default").is_ok());
+        assert!(validate_name("bot-cn").is_ok());
+        assert!(validate_name("my-bot-123").is_ok());
+        assert!(validate_name("a").is_ok());
+    }
+
+    #[test]
+    fn test_validate_name_invalid() {
+        assert!(validate_name("").is_err());
+        assert!(validate_name("-start").is_err());
+        assert!(validate_name("end-").is_err());
+        assert!(validate_name("has space").is_err());
+        assert!(validate_name("under_score").is_err());
+        assert!(validate_name("dot.name").is_err());
+        let long = "a".repeat(65);
+        assert!(validate_name(&long).is_err());
+    }
+
+    #[test]
+    fn test_service_naming() {
+        assert_eq!(
+            linux_service_name("default"),
+            "rayclaw-gateway-default.service"
+        );
+        assert_eq!(
+            linux_service_name("bot-cn"),
+            "rayclaw-gateway-bot-cn.service"
+        );
+        assert_eq!(mac_label("default"), "ai.rayclaw.gateway.default");
+        assert_eq!(mac_label("bot-cn"), "ai.rayclaw.gateway.bot-cn");
+    }
+
+    #[test]
+    fn test_log_file_naming() {
+        assert_eq!(log_stdout_file("default"), "rayclaw-gateway-default.log");
+        assert_eq!(
+            log_stderr_file("bot-cn"),
+            "rayclaw-gateway-bot-cn.error.log"
+        );
+    }
+
+    #[test]
+    fn test_extract_name_default() {
+        let args: Vec<String> = vec![];
+        let (name, rest) = extract_name(&args).unwrap();
+        assert_eq!(name, "default");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn test_extract_name_explicit() {
+        let args: Vec<String> = vec!["--name".into(), "bot-cn".into(), "100".into()];
+        let (name, rest) = extract_name(&args).unwrap();
+        assert_eq!(name, "bot-cn");
+        assert_eq!(rest, vec!["100"]);
+    }
+
+    #[test]
+    fn test_extract_name_missing_value() {
+        let args: Vec<String> = vec!["--name".into()];
+        assert!(extract_name(&args).is_err());
+    }
+
+    #[test]
+    fn test_render_linux_unit_contains_instance_name() {
         let ctx = ServiceContext {
             exe_path: PathBuf::from("/usr/local/bin/rayclaw"),
             working_dir: PathBuf::from("/tmp/rayclaw"),
@@ -528,7 +772,8 @@ mod tests {
             runtime_logs_dir: PathBuf::from("/tmp/rayclaw/runtime/logs"),
         };
 
-        let unit = render_linux_unit(&ctx);
+        let unit = render_linux_unit(&ctx, "bot-cn");
+        assert!(unit.contains("Description=RayClaw Gateway [bot-cn]"));
         assert!(unit.contains("ExecStart=/usr/local/bin/rayclaw start"));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("RAYCLAW_GATEWAY=1"));
@@ -536,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_macos_plist_contains_required_fields() {
+    fn test_render_macos_plist_contains_instance_name() {
         let ctx = ServiceContext {
             exe_path: PathBuf::from("/usr/local/bin/rayclaw"),
             working_dir: PathBuf::from("/tmp/rayclaw"),
@@ -544,12 +789,14 @@ mod tests {
             runtime_logs_dir: PathBuf::from("/tmp/rayclaw/runtime/logs"),
         };
 
-        let plist = render_macos_plist(&ctx);
+        let plist = render_macos_plist(&ctx, "bot-en");
         assert!(plist.contains("<key>Label</key>"));
-        assert!(plist.contains(MAC_LABEL));
+        assert!(plist.contains("ai.rayclaw.gateway.bot-en"));
         assert!(plist.contains("<string>start</string>"));
         assert!(plist.contains("RAYCLAW_GATEWAY"));
         assert!(plist.contains("RAYCLAW_CONFIG"));
+        assert!(plist.contains("rayclaw-gateway-bot-en.log"));
+        assert!(plist.contains("rayclaw-gateway-bot-en.error.log"));
     }
 
     #[test]

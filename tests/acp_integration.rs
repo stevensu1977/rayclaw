@@ -6,6 +6,7 @@
 //! - 7.5: E2E test stub with real Claude Code (ignored, requires API key)
 //! - 7.6: Concurrent session stress test (ignored, requires mock agent)
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rayclaw::acp::{AcpAgentConfig, AcpConfig, AcpManager};
@@ -15,17 +16,13 @@ use rayclaw::db::Database;
 use rayclaw::tools::acp::make_acp_tools;
 use rayclaw::tools::ToolRegistry;
 
+static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Create a Database backed by a unique temporary directory.
 /// Returns the DB and the path (caller should clean up or let OS handle it).
 fn temp_db() -> (Arc<Database>, String) {
-    let dir = format!(
-        "/tmp/rayclaw-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = format!("/tmp/rayclaw-test-{}-{}", std::process::id(), id);
     let _ = std::fs::create_dir_all(&dir);
     let db = Database::new(&dir).expect("failed to create DB");
     (Arc::new(db), dir)

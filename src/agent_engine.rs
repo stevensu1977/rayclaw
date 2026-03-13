@@ -557,6 +557,20 @@ pub(crate) async fn process_with_agent_impl(
             role: "user".into(),
             content: MessageContent::Text(format!("[scheduler]: {prompt}")),
         });
+    } else {
+        // No override_prompt — this is a normal user message handler.
+        // If the session ends with an assistant message and no new user messages
+        // were found, this is a stale handler (user message was already consumed
+        // by a previous run that held the chat lock). Return early to avoid
+        // sending the LLM a conversation ending with assistant (which Bedrock
+        // cross-region inference rejects as "assistant message prefill").
+        if messages.last().map(|m| m.role.as_str()) == Some("assistant") {
+            info!(
+                "Stale handler detected for chat_id={}: session ends with assistant and no new user messages. Skipping LLM call.",
+                chat_id
+            );
+            return Ok(String::new());
+        }
     }
 
     // Extract the latest user message text for relevance-based memory scoring
@@ -633,6 +647,24 @@ pub(crate) async fn process_with_agent_impl(
     // so the conversation ends on a user turn.
     while messages.last().map(|m| m.role.as_str()) == Some("assistant") {
         messages.pop();
+    }
+
+    // Safety net: after sanitize_messages (in LLM layer) removes orphaned tool_results,
+    // the conversation might end with assistant again. Append a minimal user message
+    // to guarantee the conversation always ends on a user turn.
+    // This is a belt-and-suspenders check — the stale handler early-exit above
+    // should catch most cases, but edge cases in message sanitization can still arise.
+    if messages.last().map(|m| m.role.as_str()) != Some("user") && !messages.is_empty() {
+        warn!(
+            "Post-guard messages still don't end with user for chat_id={}; appending resume prompt",
+            chat_id
+        );
+        messages.push(Message {
+            role: "user".into(),
+            content: MessageContent::Text(
+                "[system]: Please continue or summarize your previous response.".to_string(),
+            ),
+        });
     }
     if messages.is_empty() {
         return Ok("I didn't receive any message to process.".into());

@@ -109,6 +109,16 @@ pub(crate) fn sanitize_messages(messages: Vec<Message>) -> Vec<Message> {
             merged.push(msg);
         }
     }
+
+    // Final guard: after orphan removal and merging, the conversation may end
+    // with an assistant message (e.g. a user message containing only orphaned
+    // tool_results was dropped).  Some providers (AWS Bedrock) reject this
+    // ("does not support assistant message prefill"), so strip trailing
+    // assistant messages to guarantee the result ends on a user turn.
+    while merged.last().is_some_and(|m| m.role == "assistant") {
+        merged.pop();
+    }
+
     merged
 }
 
@@ -2526,7 +2536,29 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_messages_preserves_text_messages() {
+    fn test_sanitize_messages_preserves_user_ending_conversation() {
+        let msgs = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("hello".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("hi".into()),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("thanks".into()),
+            },
+        ];
+        let sanitized = sanitize_messages(msgs);
+        assert_eq!(sanitized.len(), 3);
+    }
+
+    #[test]
+    fn test_sanitize_messages_strips_trailing_assistant() {
+        // A conversation ending with assistant gets the trailing assistant
+        // stripped so providers that reject prefill don't error.
         let msgs = vec![
             Message {
                 role: "user".into(),
@@ -2538,7 +2570,41 @@ mod tests {
             },
         ];
         let sanitized = sanitize_messages(msgs);
-        assert_eq!(sanitized.len(), 2);
+        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized[0].role, "user");
+    }
+
+    #[test]
+    fn test_sanitize_messages_strips_trailing_assistant_after_orphan_removal() {
+        // Scenario: assistant with tool_use, then user with only that tool_result.
+        // After compaction the tool_use is lost — orphan removal drops the user
+        // message, leaving the assistant as the last message. sanitize_messages
+        // must strip it so providers that reject assistant prefill don't error.
+        let msgs = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("do something".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: "I'll help".into(),
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "orphaned-id".into(),
+                    content: "result".into(),
+                    is_error: None,
+                }]),
+            },
+        ];
+        let sanitized = sanitize_messages(msgs);
+        // The orphaned tool_result user message is dropped, and the trailing
+        // assistant message is also stripped — only the original user message remains.
+        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized[0].role, "user");
     }
 
     #[test]

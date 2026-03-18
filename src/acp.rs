@@ -274,11 +274,7 @@ const CGROUP_BASE: &str = "/sys/fs/cgroup/rayclaw";
 /// Apply cgroup v2 resource limits to a child process.
 /// Returns the cgroup path on success (for later cleanup), or logs a warning
 /// and returns None on failure or unsupported platforms.
-fn apply_resource_limits(
-    pid: u32,
-    session_id: &str,
-    limits: &ResourceLimits,
-) -> Option<String> {
+fn apply_resource_limits(pid: u32, session_id: &str, limits: &ResourceLimits) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         apply_resource_limits_linux(pid, session_id, limits)
@@ -286,9 +282,7 @@ fn apply_resource_limits(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (pid, session_id, limits);
-        warn!(
-            "Resource limits configured but cgroups are only supported on Linux; ignoring"
-        );
+        warn!("Resource limits configured but cgroups are only supported on Linux; ignoring");
         None
     }
 }
@@ -1203,11 +1197,7 @@ impl PtyConnection {
 
         let duration_ms = start.elapsed().as_millis();
         let text = output_lines.join("\n");
-        let messages = if text.is_empty() {
-            vec![]
-        } else {
-            vec![text]
-        };
+        let messages = if text.is_empty() { vec![] } else { vec![text] };
 
         Ok(AcpPromptResult {
             completed: true,
@@ -1376,8 +1366,11 @@ const JOB_TTL_SECS: u64 = 3600; // 1 hour
 
 /// Callback invoked when an async job completes. Receives (chat_id, message_text).
 /// Used to push results back to the user's chat via send_message.
-pub type JobCompletionCallback =
-    Arc<dyn Fn(i64, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+pub type JobCompletionCallback = Arc<
+    dyn Fn(i64, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// An active ACP agent session with its connection
 pub struct AcpSession {
@@ -1660,9 +1653,7 @@ impl AcpManager {
                 conn.prompt_streaming(params, session.auto_approve, timeout, progress_tx)
                     .await
             }
-            ConnectionKind::Pty(conn) => {
-                conn.prompt(message, timeout, progress_tx).await
-            }
+            ConnectionKind::Pty(conn) => conn.prompt(message, timeout, progress_tx).await,
         };
 
         session.status = SessionStatus::Active;
@@ -2017,9 +2008,7 @@ impl AcpManager {
             info!("ACP job {jid} finished");
         });
 
-        info!(
-            "ACP job submitted: {job_id} (session={session_id}, agent={agent_id})"
-        );
+        info!("ACP job submitted: {job_id} (session={session_id}, agent={agent_id})");
         Ok(job_id)
     }
 
@@ -3014,9 +3003,7 @@ mod tests {
     async fn test_prompt_with_none_progress_tx() {
         // Ensure prompt() still works when no progress sender is provided
         let manager = AcpManager::from_config_file("/nonexistent/acp.json");
-        let result = manager
-            .prompt("nonexistent", "hello", None, None)
-            .await;
+        let result = manager.prompt("nonexistent", "hello", None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -3135,14 +3122,20 @@ mod tests {
         drop(tx);
 
         assert!(result.completed);
-        assert!(result.messages.iter().any(|m| m.contains("progress test line")));
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("progress test line")));
 
         // Drain events — should have at least one Thinking event
         let mut events = vec![];
         while let Ok(e) = rx.try_recv() {
             events.push(e);
         }
-        assert!(!events.is_empty(), "should have at least one progress event");
+        assert!(
+            !events.is_empty(),
+            "should have at least one progress event"
+        );
         for e in &events {
             assert!(matches!(e, AcpProgressEvent::Thinking { .. }));
         }

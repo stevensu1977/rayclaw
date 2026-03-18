@@ -1567,10 +1567,7 @@ async fn favicon_file() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// Check ACP-specific API token (falls back to web_auth_token if acp_api_token is not set).
-fn require_acp_auth(
-    headers: &HeaderMap,
-    state: &WebState,
-) -> Result<(), (StatusCode, String)> {
+fn require_acp_auth(headers: &HeaderMap, state: &WebState) -> Result<(), (StatusCode, String)> {
     let token = state
         .app_state
         .acp_manager
@@ -1661,11 +1658,7 @@ async fn api_acp_create_session(
     match state
         .app_state
         .acp_manager
-        .new_session(
-            &body.agent_id,
-            body.workspace.as_deref(),
-            body.auto_approve,
-        )
+        .new_session(&body.agent_id, body.workspace.as_deref(), body.auto_approve)
         .await
     {
         Ok(info) => Ok(Json(json!({
@@ -1718,8 +1711,10 @@ async fn api_acp_prompt_stream(
     State(state): State<WebState>,
     Path(session_id): Path<String>,
     Json(body): Json<AcpPromptBody>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)>
-{
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, String),
+> {
     require_acp_auth(&headers, &state)?;
 
     let (progress_tx, mut progress_rx) =
@@ -1733,7 +1728,9 @@ async fn api_acp_prompt_stream(
     // Spawn the prompt in background so we can stream events
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let r = manager.prompt(&sid, &msg, timeout, Some(&progress_tx)).await;
+        let r = manager
+            .prompt(&sid, &msg, timeout, Some(&progress_tx))
+            .await;
         drop(progress_tx); // signal end of events
         let _ = result_tx.send(r);
     });
@@ -1816,7 +1813,13 @@ async fn api_acp_submit_job(
     match state
         .app_state
         .acp_manager
-        .submit_job(&body.session_id, &body.message, body.timeout_secs, None, None)
+        .submit_job(
+            &body.session_id,
+            &body.message,
+            body.timeout_secs,
+            None,
+            None,
+        )
         .await
     {
         Ok(job_id) => Ok(Json(json!({
@@ -1873,9 +1876,15 @@ fn build_router(web_state: WebState) -> Router {
         // ACP HTTP API
         .route("/api/acp/health", get(api_acp_health))
         .route("/api/acp/agents", get(api_acp_agents))
-        .route("/api/acp/sessions", get(api_acp_list_sessions).post(api_acp_create_session))
+        .route(
+            "/api/acp/sessions",
+            get(api_acp_list_sessions).post(api_acp_create_session),
+        )
         .route("/api/acp/sessions/:id/prompt", post(api_acp_prompt))
-        .route("/api/acp/sessions/:id/prompt/stream", post(api_acp_prompt_stream))
+        .route(
+            "/api/acp/sessions/:id/prompt/stream",
+            post(api_acp_prompt_stream),
+        )
         .route("/api/acp/sessions/:id", delete(api_acp_end_session))
         .route("/api/acp/jobs", post(api_acp_submit_job))
         .route("/api/acp/jobs/:id", get(api_acp_job_status))
@@ -2535,16 +2544,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["ok"], true);
         assert!(body["agents_configured"].is_number());
     }
 
     #[tokio::test]
     async fn test_acp_health_requires_acp_token() {
-        let web_state = test_web_state(Box::new(DummyLlm), Some("webtoken".into()), WebLimits::default());
+        let web_state = test_web_state(
+            Box::new(DummyLlm),
+            Some("webtoken".into()),
+            WebLimits::default(),
+        );
         let app = build_router(web_state);
 
         // Without token → 401
@@ -2588,9 +2604,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["ok"], true);
         assert!(body["agents"].as_array().unwrap().is_empty());
     }
@@ -2609,9 +2628,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["ok"], true);
         assert!(body["sessions"].as_array().unwrap().is_empty());
     }
@@ -2626,9 +2648,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/acp/sessions")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"agent_id": "nonexistent"}).to_string(),
-                    ))
+                    .body(Body::from(json!({"agent_id": "nonexistent"}).to_string()))
                     .unwrap(),
             )
             .await

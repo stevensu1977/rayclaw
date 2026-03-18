@@ -427,7 +427,10 @@ async fn maybe_handle_acp(
             );
 
             // Route to ACP agent
-            let prompt_result = state.acp_manager.prompt(&session_id, trimmed, None, Some(&progress_tx)).await;
+            let prompt_result = state
+                .acp_manager
+                .prompt(&session_id, trimmed, None, Some(&progress_tx))
+                .await;
 
             // Drop sender so the progress consumer task finishes
             drop(progress_tx);

@@ -439,7 +439,9 @@ async fn test_mock_agent_prompt_error_propagates() {
     let manager = mock_manager_error_mode();
 
     let info = manager.new_session("mock-error", None, None).await.unwrap();
-    let result = manager.prompt(&info.session_id, "will fail", None, None).await;
+    let result = manager
+        .prompt(&info.session_id, "will fail", None, None)
+        .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -542,7 +544,12 @@ async fn test_concurrent_sessions() {
         join_set.spawn(async move {
             let info = mgr.new_session("mock", None, None).await.unwrap();
             let result = mgr
-                .prompt(&info.session_id, &format!("concurrent task {i}"), None, None)
+                .prompt(
+                    &info.session_id,
+                    &format!("concurrent task {i}"),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
             assert!(result.completed);

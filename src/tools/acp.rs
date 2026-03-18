@@ -166,7 +166,11 @@ impl Tool for AcpPromptTool {
 
         let timeout_secs = input.get("timeout_secs").and_then(|v| v.as_u64());
 
-        match self.manager.prompt(session_id, message, timeout_secs, None).await {
+        match self
+            .manager
+            .prompt(session_id, message, timeout_secs, None)
+            .await
+        {
             Ok(result) => {
                 let tool_call_summaries: Vec<serde_json::Value> = result
                     .tool_calls

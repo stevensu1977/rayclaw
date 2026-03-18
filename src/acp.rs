@@ -269,6 +269,7 @@ fn build_spawn_command(config: &AcpAgentConfig, workspace: Option<&str>) -> Comm
 // Cgroup v2 resource isolation (Linux only)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 const CGROUP_BASE: &str = "/sys/fs/cgroup/rayclaw";
 
 /// Apply cgroup v2 resource limits to a child process.

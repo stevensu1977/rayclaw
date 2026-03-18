@@ -1,0 +1,27 @@
+{
+  "defaultAutoApprove": true,
+  "promptTimeoutSecs": 300,
+  "maxSessions": 20,
+  "maxPerAgent": 10,
+  "idleTimeoutSecs": 600,
+  "acpAgents": {
+    "claude": {
+      "launch": "npx",
+      "command": "@zed-industries/claude-agent-acp@latest",
+      "args": [],
+      "env": {
+        "CLAUDE_CODE_USE_BEDROCK": "1"
+      },
+      "workspace": "/home/user/projects",
+      "auto_approve": true
+    },
+    "kiro": {
+      "launch": "binary",
+      "command": "kiro-cli",
+      "args": ["acp", "--trust-all-tools"],
+      "env": {},
+      "workspace": "/home/user/projects",
+      "auto_approve": true
+    }
+  }
+}

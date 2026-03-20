@@ -57,3 +57,4 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
 tower = "0.5"
+http = "1"

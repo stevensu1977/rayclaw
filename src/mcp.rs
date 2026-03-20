@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use futures_util::StreamExt;
 use tracing::{error, info, warn};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-05";
@@ -116,6 +117,24 @@ struct McpHttpInner {
     next_id: u64,
 }
 
+impl McpHttpInner {
+    /// Build an HTTP request with standard MCP headers (Accept, session ID, custom headers).
+    fn build_request(&self, body: &JsonRpcRequest) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .post(&self.endpoint)
+            .json(body)
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        req
+    }
+}
+
 enum McpTransport {
     Stdio(Box<Mutex<McpStdioInner>>),
     StreamableHttp(Box<Mutex<McpHttpInner>>),
@@ -157,23 +176,64 @@ fn spawn_stdio_inner(spec: &McpStdioSpawnSpec, server_name: &str) -> Result<McpS
     })
 }
 
-/// Extract JSON from an SSE response body.
-/// Scans `data:` lines and returns the last successfully parsed JSON value.
-fn parse_sse_json(body: &str) -> Result<serde_json::Value, String> {
-    let mut last_json: Option<serde_json::Value> = None;
-    for line in body.lines() {
+/// Extract the `data:` payload from a single SSE event block.
+fn extract_sse_data(event: &str) -> Option<String> {
+    for line in event.lines() {
         let trimmed = line.trim();
         if let Some(data) = trimmed.strip_prefix("data:") {
             let data = data.trim();
-            if data.is_empty() {
-                continue;
-            }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
-                last_json = Some(val);
+            if !data.is_empty() {
+                return Some(data.to_string());
             }
         }
     }
-    last_json.ok_or_else(|| "No JSON found in SSE response".to_string())
+    None
+}
+
+/// Try to extract a JSON-RPC response matching `request_id` from an SSE event block.
+fn try_match_sse_event(event: &str, request_id: u64) -> Option<serde_json::Value> {
+    let data = extract_sse_data(event)?;
+    let val = serde_json::from_str::<serde_json::Value>(&data).ok()?;
+    if val.get("id").and_then(|v| v.as_u64()) == Some(request_id) {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+/// Read an SSE stream from an HTTP response, returning the JSON-RPC response
+/// that matches the given request `id`. Processes chunks incrementally so it
+/// works with both buffered and long-lived SSE connections.
+async fn read_sse_stream(
+    response: reqwest::Response,
+    request_id: u64,
+) -> Result<serde_json::Value, String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("SSE stream error: {e}"))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Process complete SSE events (delimited by double newline)
+        while let Some(pos) = buffer.find("\n\n") {
+            let event = buffer[..pos].to_string();
+            buffer.drain(..pos + 2);
+
+            if let Some(val) = try_match_sse_event(&event, request_id) {
+                return Ok(val);
+            }
+        }
+    }
+
+    // Stream ended — check if any remaining data in the buffer contains our response
+    if !buffer.trim().is_empty() {
+        if let Some(val) = try_match_sse_event(&buffer, request_id) {
+            return Ok(val);
+        }
+    }
+
+    Err("SSE stream ended without a matching JSON-RPC response".to_string())
 }
 
 impl McpServer {
@@ -553,17 +613,7 @@ impl McpServer {
             params,
         };
 
-        let mut req = inner
-            .client
-            .post(&inner.endpoint)
-            .json(&request)
-            .header("Accept", "application/json, text/event-stream");
-        if let Some(sid) = &inner.session_id {
-            req = req.header("Mcp-Session-Id", sid);
-        }
-        for (k, v) in &inner.headers {
-            req = req.header(k, v);
-        }
+        let req = inner.build_request(&request);
 
         let response = req
             .send()
@@ -593,11 +643,7 @@ impl McpServer {
             .to_string();
 
         let body_json = if content_type.contains("text/event-stream") {
-            let body_text = response
-                .text()
-                .await
-                .map_err(|e| format!("Failed to read SSE response body: {e}"))?;
-            parse_sse_json(&body_text)?
+            read_sse_stream(response, id).await?
         } else {
             response
                 .json()
@@ -638,7 +684,7 @@ impl McpServer {
         match &self.transport {
             McpTransport::Stdio(_) => self.send_notification_stdio_once(method, params).await,
             McpTransport::StreamableHttp(inner) => {
-                let inner = inner.lock().await;
+                let mut inner = inner.lock().await;
                 let request = JsonRpcRequest {
                     jsonrpc: "2.0".to_string(),
                     id: None,
@@ -646,22 +692,22 @@ impl McpServer {
                     params,
                 };
 
-                let mut req = inner
-                    .client
-                    .post(&inner.endpoint)
-                    .json(&request)
-                    .header("Accept", "application/json, text/event-stream");
-                if let Some(sid) = &inner.session_id {
-                    req = req.header("Mcp-Session-Id", sid);
-                }
-                for (k, v) in &inner.headers {
-                    req = req.header(k, v);
-                }
+                let req = inner.build_request(&request);
 
                 let response = req
                     .send()
                     .await
                     .map_err(|e| format!("HTTP notification failed: {e}"))?;
+
+                // Capture session ID from response (spec allows it on any response)
+                if let Some(sid) = response
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    inner.session_id = Some(sid.to_string());
+                }
+
                 if response.status().is_success() {
                     Ok(())
                 } else {
@@ -982,24 +1028,48 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_sse_json() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
-        let val = parse_sse_json(body).unwrap();
+    fn test_extract_sse_data() {
+        let event = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}";
+        let data = extract_sse_data(event).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(val["id"], 1);
         assert_eq!(val["result"]["ok"], true);
     }
 
     #[test]
-    fn test_parse_sse_json_multiple_data_lines() {
+    fn test_extract_sse_data_no_data_line() {
+        let event = "event: ping";
+        assert!(extract_sse_data(event).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_single_event() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let response = http::Response::builder()
+            .body(body)
+            .unwrap();
+        let response = reqwest::Response::from(response);
+        let val = read_sse_stream(response, 1).await.unwrap();
+        assert_eq!(val["id"], 1);
+        assert_eq!(val["result"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_matches_request_id() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"first\":true}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"second\":true}}\n\n";
-        let val = parse_sse_json(body).unwrap();
-        // Returns the last JSON message
+        let response = reqwest::Response::from(
+            http::Response::builder().body(body).unwrap(),
+        );
+        let val = read_sse_stream(response, 2).await.unwrap();
         assert_eq!(val["result"]["second"], true);
     }
 
-    #[test]
-    fn test_parse_sse_json_no_data() {
+    #[tokio::test]
+    async fn test_read_sse_stream_no_match() {
         let body = "event: ping\n\n";
-        assert!(parse_sse_json(body).is_err());
+        let response = reqwest::Response::from(
+            http::Response::builder().body(body).unwrap(),
+        );
+        assert!(read_sse_stream(response, 1).await.is_err());
     }
 }

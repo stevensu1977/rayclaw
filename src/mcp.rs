@@ -1072,4 +1072,78 @@ mod tests {
         );
         assert!(read_sse_stream(response, 1).await.is_err());
     }
+
+    #[test]
+    fn test_try_match_sse_event_matching_id() {
+        let event = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"ok\":true}}";
+        let val = try_match_sse_event(event, 5).unwrap();
+        assert_eq!(val["id"], 5);
+        assert_eq!(val["result"]["ok"], true);
+    }
+
+    #[test]
+    fn test_try_match_sse_event_wrong_id() {
+        let event = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}";
+        assert!(try_match_sse_event(event, 99).is_none());
+    }
+
+    #[test]
+    fn test_try_match_sse_event_no_data() {
+        let event = "event: ping";
+        assert!(try_match_sse_event(event, 1).is_none());
+    }
+
+    #[test]
+    fn test_try_match_sse_event_invalid_json() {
+        let event = "data: not-valid-json";
+        assert!(try_match_sse_event(event, 1).is_none());
+    }
+
+    #[test]
+    fn test_try_match_sse_event_no_id_field() {
+        let event = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}";
+        assert!(try_match_sse_event(event, 1).is_none());
+    }
+
+    #[test]
+    fn test_build_request_includes_session_id() {
+        let client = reqwest::Client::new();
+        let inner = McpHttpInner {
+            client,
+            endpoint: "http://localhost:8080/mcp".to_string(),
+            headers: HashMap::from([("X-Custom".to_string(), "val".to_string())]),
+            session_id: Some("test-session-123".to_string()),
+            next_id: 1,
+        };
+        let body = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(1),
+            method: "test".to_string(),
+            params: None,
+        };
+        let req = inner.build_request(&body).build().unwrap();
+        assert_eq!(req.headers().get("Mcp-Session-Id").unwrap(), "test-session-123");
+        assert_eq!(req.headers().get("X-Custom").unwrap(), "val");
+        assert!(req.headers().get("Accept").unwrap().to_str().unwrap().contains("text/event-stream"));
+    }
+
+    #[test]
+    fn test_build_request_no_session_id() {
+        let client = reqwest::Client::new();
+        let inner = McpHttpInner {
+            client,
+            endpoint: "http://localhost:8080/mcp".to_string(),
+            headers: HashMap::new(),
+            session_id: None,
+            next_id: 1,
+        };
+        let body = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(1),
+            method: "test".to_string(),
+            params: None,
+        };
+        let req = inner.build_request(&body).build().unwrap();
+        assert!(req.headers().get("Mcp-Session-Id").is_none());
+    }
 }

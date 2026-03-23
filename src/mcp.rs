@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use futures_util::StreamExt;
 use tracing::{error, info, warn};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-05";
@@ -112,7 +113,26 @@ struct McpHttpInner {
     client: reqwest::Client,
     endpoint: String,
     headers: HashMap<String, String>,
+    session_id: Option<String>,
     next_id: u64,
+}
+
+impl McpHttpInner {
+    /// Build an HTTP request with standard MCP headers (Accept, session ID, custom headers).
+    fn build_request(&self, body: &JsonRpcRequest) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .post(&self.endpoint)
+            .json(body)
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        req
+    }
 }
 
 enum McpTransport {
@@ -154,6 +174,66 @@ fn spawn_stdio_inner(spec: &McpStdioSpawnSpec, server_name: &str) -> Result<McpS
         _child: child,
         next_id: 1,
     })
+}
+
+/// Extract the `data:` payload from a single SSE event block.
+fn extract_sse_data(event: &str) -> Option<String> {
+    for line in event.lines() {
+        let trimmed = line.trim();
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            let data = data.trim();
+            if !data.is_empty() {
+                return Some(data.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Try to extract a JSON-RPC response matching `request_id` from an SSE event block.
+fn try_match_sse_event(event: &str, request_id: u64) -> Option<serde_json::Value> {
+    let data = extract_sse_data(event)?;
+    let val = serde_json::from_str::<serde_json::Value>(&data).ok()?;
+    if val.get("id").and_then(|v| v.as_u64()) == Some(request_id) {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+/// Read an SSE stream from an HTTP response, returning the JSON-RPC response
+/// that matches the given request `id`. Processes chunks incrementally so it
+/// works with both buffered and long-lived SSE connections.
+async fn read_sse_stream(
+    response: reqwest::Response,
+    request_id: u64,
+) -> Result<serde_json::Value, String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("SSE stream error: {e}"))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Process complete SSE events (delimited by double newline)
+        while let Some(pos) = buffer.find("\n\n") {
+            let event = buffer[..pos].to_string();
+            buffer.drain(..pos + 2);
+
+            if let Some(val) = try_match_sse_event(&event, request_id) {
+                return Ok(val);
+            }
+        }
+    }
+
+    // Stream ended — check if any remaining data in the buffer contains our response
+    if !buffer.trim().is_empty() {
+        if let Some(val) = try_match_sse_event(&buffer, request_id) {
+            return Ok(val);
+        }
+    }
+
+    Err("SSE stream ended without a matching JSON-RPC response".to_string())
 }
 
 impl McpServer {
@@ -208,6 +288,7 @@ impl McpServer {
                         client,
                         endpoint: config.endpoint.clone(),
                         headers: config.headers.clone(),
+                        session_id: None,
                         next_id: 1,
                     }))),
                     None,
@@ -532,37 +613,56 @@ impl McpServer {
             params,
         };
 
-        let mut req = inner.client.post(&inner.endpoint).json(&request);
-        for (k, v) in &inner.headers {
-            req = req.header(k, v);
-        }
+        let req = inner.build_request(&request);
 
         let response = req
             .send()
             .await
             .map_err(|e| format!("HTTP request failed: {e}"))?;
         let status = response.status();
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse HTTP MCP response: {e}"))?;
 
-        if !status.is_success() {
-            return Err(format!("HTTP MCP request failed with {status}: {body}"));
+        // Capture session ID from response header
+        if let Some(sid) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            inner.session_id = Some(sid.to_string());
         }
 
-        if let Ok(parsed) = serde_json::from_value::<JsonRpcResponse>(body.clone()) {
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(format!("HTTP MCP request failed with {status}: {body_text}"));
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body_json = if content_type.contains("text/event-stream") {
+            read_sse_stream(response, id).await?
+        } else {
+            response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse HTTP MCP response: {e}"))?
+        };
+
+        if let Ok(parsed) = serde_json::from_value::<JsonRpcResponse>(body_json.clone()) {
             if let Some(err) = parsed.error {
                 return Err(format!("MCP error ({}): {}", err.code, err.message));
             }
             return Ok(parsed.result.unwrap_or(serde_json::Value::Null));
         }
 
-        if let Some(result) = body.get("result") {
+        if let Some(result) = body_json.get("result") {
             return Ok(result.clone());
         }
 
-        Ok(body)
+        Ok(body_json)
     }
 
     async fn send_request(
@@ -584,7 +684,7 @@ impl McpServer {
         match &self.transport {
             McpTransport::Stdio(_) => self.send_notification_stdio_once(method, params).await,
             McpTransport::StreamableHttp(inner) => {
-                let inner = inner.lock().await;
+                let mut inner = inner.lock().await;
                 let request = JsonRpcRequest {
                     jsonrpc: "2.0".to_string(),
                     id: None,
@@ -592,15 +692,22 @@ impl McpServer {
                     params,
                 };
 
-                let mut req = inner.client.post(&inner.endpoint).json(&request);
-                for (k, v) in &inner.headers {
-                    req = req.header(k, v);
-                }
+                let req = inner.build_request(&request);
 
                 let response = req
                     .send()
                     .await
                     .map_err(|e| format!("HTTP notification failed: {e}"))?;
+
+                // Capture session ID from response (spec allows it on any response)
+                if let Some(sid) = response
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    inner.session_id = Some(sid.to_string());
+                }
+
                 if response.status().is_success() {
                     Ok(())
                 } else {
@@ -918,5 +1025,181 @@ mod tests {
         assert_eq!(remote.endpoint, "http://127.0.0.1:8080/mcp");
         assert_eq!(remote.max_retries, Some(3));
         assert_eq!(remote.health_interval_secs, Some(15));
+    }
+
+    #[test]
+    fn test_extract_sse_data() {
+        let event = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}";
+        let data = extract_sse_data(event).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(val["id"], 1);
+        assert_eq!(val["result"]["ok"], true);
+    }
+
+    #[test]
+    fn test_extract_sse_data_no_data_line() {
+        let event = "event: ping";
+        assert!(extract_sse_data(event).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_single_event() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let response = http::Response::builder()
+            .body(body)
+            .unwrap();
+        let response = reqwest::Response::from(response);
+        let val = read_sse_stream(response, 1).await.unwrap();
+        assert_eq!(val["id"], 1);
+        assert_eq!(val["result"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_matches_request_id() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"first\":true}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"second\":true}}\n\n";
+        let response = reqwest::Response::from(
+            http::Response::builder().body(body).unwrap(),
+        );
+        let val = read_sse_stream(response, 2).await.unwrap();
+        assert_eq!(val["result"]["second"], true);
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_no_match() {
+        let body = "event: ping\n\n";
+        let response = reqwest::Response::from(
+            http::Response::builder().body(body).unwrap(),
+        );
+        assert!(read_sse_stream(response, 1).await.is_err());
+    }
+
+    #[test]
+    fn test_try_match_sse_event_matching_id() {
+        let event = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"ok\":true}}";
+        let val = try_match_sse_event(event, 5).unwrap();
+        assert_eq!(val["id"], 5);
+        assert_eq!(val["result"]["ok"], true);
+    }
+
+    #[test]
+    fn test_try_match_sse_event_wrong_id() {
+        let event = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}";
+        assert!(try_match_sse_event(event, 99).is_none());
+    }
+
+    #[test]
+    fn test_try_match_sse_event_no_data() {
+        let event = "event: ping";
+        assert!(try_match_sse_event(event, 1).is_none());
+    }
+
+    #[test]
+    fn test_try_match_sse_event_invalid_json() {
+        let event = "data: not-valid-json";
+        assert!(try_match_sse_event(event, 1).is_none());
+    }
+
+    #[test]
+    fn test_try_match_sse_event_no_id_field() {
+        let event = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}";
+        assert!(try_match_sse_event(event, 1).is_none());
+    }
+
+    #[test]
+    fn test_build_request_includes_session_id() {
+        let client = reqwest::Client::new();
+        let inner = McpHttpInner {
+            client,
+            endpoint: "http://localhost:8080/mcp".to_string(),
+            headers: HashMap::from([("X-Custom".to_string(), "val".to_string())]),
+            session_id: Some("test-session-123".to_string()),
+            next_id: 1,
+        };
+        let body = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(1),
+            method: "test".to_string(),
+            params: None,
+        };
+        let req = inner.build_request(&body).build().unwrap();
+        assert_eq!(req.headers().get("Mcp-Session-Id").unwrap(), "test-session-123");
+        assert_eq!(req.headers().get("X-Custom").unwrap(), "val");
+        assert!(req.headers().get("Accept").unwrap().to_str().unwrap().contains("text/event-stream"));
+    }
+
+    /// Helper: build a reqwest::Response from a stream of byte chunks.
+    fn response_from_chunks(chunks: Vec<&'static [u8]>) -> reqwest::Response {
+        let stream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, std::io::Error>(Vec::from(c))),
+        );
+        let body = reqwest::Body::wrap_stream(stream);
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_chunked_event_split_across_chunks() {
+        // SSE event arrives in two chunks: header in one, data in another
+        let response = response_from_chunks(vec![
+            b"event: message\n",
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        ]);
+        let val = read_sse_stream(response, 1).await.unwrap();
+        assert_eq!(val["id"], 1);
+        assert_eq!(val["result"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_data_line_split_mid_json() {
+        // JSON payload itself is split across two chunks
+        let response = response_from_chunks(vec![
+            b"data: {\"jsonrpc\":\"2.0\",",
+            b"\"id\":3,\"result\":{\"v\":42}}\n\n",
+        ]);
+        let val = read_sse_stream(response, 3).await.unwrap();
+        assert_eq!(val["result"]["v"], 42);
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_skips_non_matching_then_matches() {
+        // First event has id=1, second has id=2 — request wants id=2
+        let response = response_from_chunks(vec![
+            b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":1}}\n\n",
+            b"event: message\n",
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"b\":2}}\n\n",
+        ]);
+        let val = read_sse_stream(response, 2).await.unwrap();
+        assert_eq!(val["result"]["b"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_sse_stream_trailing_buffer_no_double_newline() {
+        // Stream ends with data but no trailing \n\n — falls back to buffer check
+        let response = response_from_chunks(vec![
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tail\":true}}",
+        ]);
+        let val = read_sse_stream(response, 7).await.unwrap();
+        assert_eq!(val["result"]["tail"], true);
+    }
+
+    #[test]
+    fn test_build_request_no_session_id() {
+        let client = reqwest::Client::new();
+        let inner = McpHttpInner {
+            client,
+            endpoint: "http://localhost:8080/mcp".to_string(),
+            headers: HashMap::new(),
+            session_id: None,
+            next_id: 1,
+        };
+        let body = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(1),
+            method: "test".to_string(),
+            params: None,
+        };
+        let req = inner.build_request(&body).build().unwrap();
+        assert!(req.headers().get("Mcp-Session-Id").is_none());
     }
 }

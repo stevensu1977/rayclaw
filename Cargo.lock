@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "rayclaw"
-version = "0.3.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-stream",

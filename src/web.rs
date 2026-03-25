@@ -1786,7 +1786,7 @@ async fn api_acp_prompt_stream(
             }
         }
 
-        yield Ok(Event::default().event("done").data("{}".to_string()));
+        yield Ok(Event::default().event("done").data("{}"));
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
@@ -2259,6 +2259,7 @@ mod tests {
             skip_tool_approval: false,
             skills_dir: None,
             channels: std::collections::HashMap::new(),
+            prompt_cache_ttl: "none".into(),
         };
         let dir = std::env::temp_dir().join(format!("rayclaw_webtest_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();

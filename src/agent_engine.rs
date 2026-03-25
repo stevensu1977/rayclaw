@@ -1884,6 +1884,7 @@ mod tests {
             skip_tool_approval: false,
             skills_dir: None,
             channels: std::collections::HashMap::new(),
+            prompt_cache_ttl: "none".into(),
         };
         cfg.data_dir = base_dir.to_string_lossy().to_string();
         cfg.working_dir = base_dir.join("tmp").to_string_lossy().to_string();
@@ -2228,6 +2229,7 @@ mod tests {
             skip_tool_approval: false,
             skills_dir: None,
             channels: std::collections::HashMap::new(),
+            prompt_cache_ttl: "none".into(),
         };
 
         let soul = super::load_soul_content(&config, 999);
@@ -2295,6 +2297,7 @@ mod tests {
             aws_profile: None,
             skills_dir: None,
             channels: std::collections::HashMap::new(),
+            prompt_cache_ttl: "none".into(),
         };
 
         let soul = super::load_soul_content(&config, 999);

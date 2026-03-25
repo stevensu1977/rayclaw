@@ -1550,11 +1550,7 @@ async fn icon_file() -> impl IntoResponse {
 
 async fn logo_file() -> impl IntoResponse {
     match WEB_ASSETS.get_file("logo.png") {
-        Some(file) => (
-            [("content-type", "image/png")],
-            file.contents().to_vec(),
-        )
-            .into_response(),
+        Some(file) => ([("content-type", "image/png")], file.contents().to_vec()).into_response(),
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
 }

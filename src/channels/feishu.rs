@@ -66,6 +66,108 @@ pub struct FeishuChannelConfig {
 }
 
 // ---------------------------------------------------------------------------
+// File reception constants
+// ---------------------------------------------------------------------------
+
+/// Max size for inlining text-type files into the LLM prompt (512 KB).
+const FILE_MAX_INLINE_BYTES: usize = 512 * 1024;
+/// Max size for base64-encoding image-type files (5 MB).
+const FILE_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Extensions recognized as text files that can be inlined.
+const TEXT_EXTENSIONS: &[&str] = &[
+    "txt",
+    "md",
+    "rs",
+    "py",
+    "js",
+    "ts",
+    "tsx",
+    "jsx",
+    "java",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "go",
+    "rb",
+    "sh",
+    "bash",
+    "zsh",
+    "toml",
+    "yaml",
+    "yml",
+    "json",
+    "xml",
+    "html",
+    "css",
+    "scss",
+    "sql",
+    "csv",
+    "tsv",
+    "log",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "dockerfile",
+    "makefile",
+    "gitignore",
+    "editorconfig",
+    "properties",
+    "gradle",
+    "swift",
+    "kt",
+    "lua",
+    "r",
+    "pl",
+];
+
+/// Extensions recognized as images.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "svg"];
+
+fn is_text_extension(ext: &str) -> bool {
+    TEXT_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+}
+
+fn is_image_extension(ext: &str) -> bool {
+    IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+}
+
+/// Check if bytes look like text (no null bytes in the first 8KB).
+fn looks_like_text(data: &[u8]) -> bool {
+    let check_len = data.len().min(8192);
+    !data[..check_len].contains(&0)
+}
+
+/// Map file extension to Feishu upload file_type for correct client preview.
+fn resolve_file_type(ext: &str) -> String {
+    match ext.to_lowercase().as_str() {
+        "opus" | "ogg" | "mp3" | "wav" | "m4a" | "aac" | "flac" => "opus".into(),
+        "mp4" | "mov" | "avi" | "mkv" | "webm" => "mp4".into(),
+        "pdf" => "pdf".into(),
+        "doc" | "docx" => "doc".into(),
+        "xls" | "xlsx" => "xls".into(),
+        "ppt" | "pptx" => "ppt".into(),
+        _ => "stream".into(),
+    }
+}
+
+/// Sanitize a filename: strip control characters and path separators, preserve UTF-8.
+fn sanitize_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\' && *c != '\0')
+        .collect();
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        "attachment.bin".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Domain resolution
 // ---------------------------------------------------------------------------
 
@@ -301,11 +403,12 @@ impl ChannelAdapter for FeishuAdapter {
         caption: Option<&str>,
     ) -> Result<String, String> {
         let token = self.ensure_token().await?;
-        let filename = file_path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
+        let filename = sanitize_filename(
+            file_path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or("attachment.bin"),
+        );
         let bytes = tokio::fs::read(file_path)
             .await
             .map_err(|e| format!("Failed to read attachment: {e}"))?;
@@ -390,7 +493,7 @@ impl ChannelAdapter for FeishuAdapter {
         } else {
             // Upload file
             let form = reqwest::multipart::Form::new()
-                .text("file_type", "stream")
+                .text("file_type", resolve_file_type(&ext))
                 .text("file_name", filename.clone())
                 .part(
                     "file",
@@ -782,31 +885,77 @@ fn parse_message_content(content: &str, message_type: &str) -> String {
             }
         }
         "post" => {
-            // Rich text: try to extract plain text from the post structure
+            // Rich text: extract plain text, links, and @mentions from the post structure
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
-                // Post content has locale keys (zh_cn, en_us, etc.) with title + content array
                 let mut texts = Vec::new();
-                if let Some(obj) = v.as_object() {
-                    // Use first locale only
-                    if let Some((_lang, post)) = obj.iter().next() {
-                        if let Some(title) = post.get("title").and_then(|t| t.as_str()) {
-                            if !title.is_empty() {
-                                texts.push(title.to_string());
-                            }
+                let extract_post_body = |post: &serde_json::Value, out: &mut Vec<String>| {
+                    if let Some(title) = post.get("title").and_then(|t| t.as_str()) {
+                        if !title.is_empty() {
+                            out.push(title.to_string());
                         }
-                        if let Some(content_arr) = post.get("content").and_then(|c| c.as_array()) {
-                            for line in content_arr {
-                                if let Some(elements) = line.as_array() {
-                                    for elem in elements {
-                                        if let Some(text) =
-                                            elem.get("text").and_then(|t| t.as_str())
-                                        {
-                                            texts.push(text.to_string());
+                    }
+                    if let Some(content_arr) = post.get("content").and_then(|c| c.as_array()) {
+                        for line in content_arr {
+                            if let Some(elements) = line.as_array() {
+                                for elem in elements {
+                                    let tag =
+                                        elem.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+                                    match tag {
+                                        "text" => {
+                                            if let Some(t) =
+                                                elem.get("text").and_then(|t| t.as_str())
+                                            {
+                                                out.push(t.to_string());
+                                            }
+                                        }
+                                        "a" => {
+                                            let label = elem
+                                                .get("text")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("");
+                                            let href = elem
+                                                .get("href")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("");
+                                            if !href.is_empty() {
+                                                if label.is_empty() {
+                                                    out.push(href.to_string());
+                                                } else {
+                                                    out.push(format!("[{label}]({href})"));
+                                                }
+                                            } else if !label.is_empty() {
+                                                out.push(label.to_string());
+                                            }
+                                        }
+                                        "at" => {
+                                            if let Some(name) =
+                                                elem.get("user_name").and_then(|t| t.as_str())
+                                            {
+                                                out.push(format!("@{name}"));
+                                            }
+                                        }
+                                        "img" => {
+                                            out.push("[image]".to_string());
+                                        }
+                                        _ => {
+                                            if let Some(t) =
+                                                elem.get("text").and_then(|t| t.as_str())
+                                            {
+                                                out.push(t.to_string());
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+                };
+
+                if let Some(obj) = v.as_object() {
+                    if v.get("content").is_some() {
+                        extract_post_body(&v, &mut texts);
+                    } else if let Some((_lang, post)) = obj.iter().next() {
+                        extract_post_body(post, &mut texts);
                     }
                 }
                 if texts.is_empty() {
@@ -956,27 +1105,30 @@ async fn get_token(
         .ok_or_else(|| "Missing tenant_access_token".to_string())
 }
 
-/// Download an image from Feishu using the message resources API.
-/// Uses `GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image`.
-async fn download_feishu_image(
+/// Download a resource (image or file) from Feishu using the message resources API.
+/// Uses `GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={res_type}`.
+/// `res_type` should be `"image"` or `"file"`.
+async fn download_feishu_resource(
     http_client: &reqwest::Client,
     base_url: &str,
     token: &str,
     message_id: &str,
     file_key: &str,
+    res_type: &str,
 ) -> Result<Vec<u8>, String> {
-    let url =
-        format!("{base_url}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image");
+    let url = format!(
+        "{base_url}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={res_type}"
+    );
     let resp = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
-        .map_err(|e| format!("Failed to download feishu image: {e}"))?;
+        .map_err(|e| format!("Failed to download feishu {res_type}: {e}"))?;
 
     if !resp.status().is_success() {
         return Err(format!(
-            "Feishu image download failed: status={}",
+            "Feishu {res_type} download failed: status={}",
             resp.status()
         ));
     }
@@ -984,58 +1136,59 @@ async fn download_feishu_image(
     resp.bytes()
         .await
         .map(|b| b.to_vec())
-        .map_err(|e| format!("Failed to read feishu image bytes: {e}"))
+        .map_err(|e| format!("Failed to read feishu {res_type} bytes: {e}"))
 }
 
-/// Extract image_key from Feishu message content.
-/// - For `message_type == "image"`: content is `{"image_key":"img_xxx"}`
-/// - For `message_type == "post"`: scan elements for `{"tag":"img","image_key":"img_xxx"}`
+/// Extract all image_keys from Feishu message content.
+/// - For `message_type == "image"`: content is `{"image_key":"img_xxx"}` → single key
+/// - For `message_type == "post"`: scan elements for all `{"tag":"img","image_key":"img_xxx"}`
 ///   Handles both locale-wrapped format `{"zh_cn":{"title":"","content":[...]}}` and
 ///   direct format `{"title":"","content":[...]}`.
-fn extract_image_key(content_raw: &str, message_type: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(content_raw).ok()?;
+fn extract_image_keys(content_raw: &str, message_type: &str) -> Vec<String> {
+    let v: serde_json::Value = match serde_json::from_str(content_raw) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
     match message_type {
         "image" => v
             .get("image_key")
             .and_then(|k| k.as_str())
-            .map(|s| s.to_string()),
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
         "post" => {
-            // Helper: scan a content array for img elements
-            let scan_content = |content_arr: &[serde_json::Value]| -> Option<String> {
+            let mut keys = Vec::new();
+            let scan_content = |content_arr: &[serde_json::Value], out: &mut Vec<String>| {
                 for line in content_arr {
                     if let Some(elements) = line.as_array() {
                         for elem in elements {
                             if elem.get("tag").and_then(|t| t.as_str()) == Some("img") {
                                 if let Some(key) = elem.get("image_key").and_then(|k| k.as_str()) {
-                                    return Some(key.to_string());
+                                    out.push(key.to_string());
                                 }
                             }
                         }
                     }
                 }
-                None
             };
 
             // Case 1: Direct format {"title":"","content":[[...]]}
             if let Some(content_arr) = v.get("content").and_then(|c| c.as_array()) {
-                if let Some(key) = scan_content(content_arr) {
-                    return Some(key);
-                }
+                scan_content(content_arr, &mut keys);
             }
 
             // Case 2: Locale-wrapped format {"zh_cn":{"title":"","content":[[...]]}}
-            if let Some(obj) = v.as_object() {
-                for (_lang, post) in obj.iter() {
-                    if let Some(content_arr) = post.get("content").and_then(|c| c.as_array()) {
-                        if let Some(key) = scan_content(content_arr) {
-                            return Some(key);
+            if keys.is_empty() {
+                if let Some(obj) = v.as_object() {
+                    for (_lang, post) in obj.iter() {
+                        if let Some(content_arr) = post.get("content").and_then(|c| c.as_array()) {
+                            scan_content(content_arr, &mut keys);
                         }
                     }
                 }
             }
-            None
+            keys
         }
-        _ => None,
+        _ => vec![],
     }
 }
 
@@ -1306,6 +1459,133 @@ async fn is_duplicate_message(message_id: &str, db: &std::sync::Arc<crate::db::D
 // Event handling (shared by WS and webhook)
 // ---------------------------------------------------------------------------
 
+/// Handle a "file" type message: download, classify, and route to the agent.
+/// Three-path strategy:
+///   1. Image file (≤5MB, image extension or MIME) → base64 for LLM vision
+///   2. Text file (≤512KB, text extension, no null bytes) → inline content
+///   3. Binary / oversized → metadata marker "[FILE: name | size | type]"
+#[allow(clippy::too_many_arguments)]
+async fn handle_file_message(
+    app_state: &Arc<AppState>,
+    feishu_cfg: &FeishuChannelConfig,
+    base_url: &str,
+    bot_open_id: &str,
+    chat_id_str: &str,
+    sender_open_id: &str,
+    content_raw: &str,
+    message_id: &str,
+    is_dm: bool,
+) {
+    // Parse content: {"file_key":"...", "file_name":"...", "file_size":"..."}
+    let content: serde_json::Value = match serde_json::from_str(content_raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let file_key = content
+        .get("file_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let file_name = content
+        .get("file_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    if file_key.is_empty() {
+        return;
+    }
+
+    let ext = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Download the file
+    let http_client = reqwest::Client::new();
+    let token = match get_token(
+        &http_client,
+        base_url,
+        &feishu_cfg.app_id,
+        &feishu_cfg.app_secret,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Feishu: failed to get token for file download: {e}");
+            return;
+        }
+    };
+
+    let bytes = match download_feishu_resource(
+        &http_client,
+        base_url,
+        &token,
+        message_id,
+        file_key,
+        "file",
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Feishu: failed to download file {file_key}: {e}");
+            return;
+        }
+    };
+
+    let file_size = bytes.len();
+    info!("Feishu file downloaded: name={file_name}, size={file_size}, ext={ext}");
+
+    // Three-path classification
+    let text: String;
+    let mut image_data: Option<(String, String)> = None;
+
+    if is_image_extension(&ext) && file_size <= FILE_MAX_IMAGE_BYTES {
+        // Path 1: Image file → base64 for LLM vision
+        let b64 = image_utils::base64_encode(&bytes);
+        let media = image_utils::guess_image_media_type(&bytes);
+        image_data = Some((b64, media));
+        text = format!("Please analyze this image file: {file_name}");
+    } else if (is_text_extension(&ext) || looks_like_text(&bytes))
+        && file_size <= FILE_MAX_INLINE_BYTES
+    {
+        // Path 2: Text file → inline content
+        let content_str = String::from_utf8_lossy(&bytes);
+        text = format!(
+            "The user sent a file `{file_name}` ({file_size} bytes). Here is its content:\n\n```{ext}\n{content_str}\n```"
+        );
+    } else {
+        // Path 3: Binary / oversized → metadata marker
+        let size_human = if file_size >= 1024 * 1024 {
+            format!("{:.1}MB", file_size as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{:.1}KB", file_size as f64 / 1024.0)
+        };
+        text = format!(
+            "The user sent a file that cannot be displayed inline.\n[FILE: {file_name} | size={size_human} | ext={ext}]"
+        );
+    }
+
+    // File messages in groups: @mention info isn't available in file content JSON,
+    // so we treat file messages as always "mentioned" in DMs and not in groups.
+    let is_mentioned = false;
+
+    handle_feishu_message(
+        app_state.clone(),
+        feishu_cfg,
+        base_url,
+        bot_open_id,
+        chat_id_str,
+        sender_open_id,
+        &text,
+        is_dm,
+        is_mentioned,
+        message_id,
+        image_data,
+    )
+    .await;
+}
+
 /// Handle a Feishu event envelope. Dispatches im.message.receive_v1 events.
 async fn handle_feishu_event(
     app_state: Arc<AppState>,
@@ -1390,15 +1670,35 @@ async fn handle_feishu_event(
     }
 
     let is_dm = chat_type_raw == "p2p";
+
+    // --- File message handling (three-path strategy) ---
+    // For "file" messages, download and classify: image → base64, text → inline, binary → metadata
+    if message_type == "file" {
+        handle_file_message(
+            &app_state,
+            feishu_cfg,
+            base_url,
+            bot_open_id,
+            chat_id_str,
+            sender_open_id,
+            content_raw,
+            message_id,
+            is_dm,
+        )
+        .await;
+        return;
+    }
+
     let text = parse_message_content(content_raw, message_type);
 
-    // --- Image handling ---
-    let image_key = extract_image_key(content_raw, message_type);
+    // --- Image handling (supports multiple images from post messages) ---
+    let image_keys = extract_image_keys(content_raw, message_type);
+    let has_image = !image_keys.is_empty();
+    // We pass the first image as the primary image_data for the LLM vision call.
+    // Additional images are noted in the text.
     let mut image_data: Option<(String, String)> = None;
-    let has_image = image_key.is_some();
 
-    if let Some(ref key) = image_key {
-        // Need a token to download the image
+    if !image_keys.is_empty() {
         let http_client = reqwest::Client::new();
         match get_token(
             &http_client,
@@ -1409,18 +1709,32 @@ async fn handle_feishu_event(
         .await
         {
             Ok(token) => {
-                match download_feishu_image(&http_client, base_url, &token, message_id, key).await {
-                    Ok(bytes) => {
-                        let b64 = image_utils::base64_encode(&bytes);
-                        let media = image_utils::guess_image_media_type(&bytes);
-                        info!(
-                            "Feishu image downloaded: key={key}, size={}, type={media}",
-                            bytes.len()
-                        );
-                        image_data = Some((b64, media));
-                    }
-                    Err(e) => {
-                        error!("Feishu: failed to download image {key}: {e}");
+                for (i, key) in image_keys.iter().enumerate() {
+                    match download_feishu_resource(
+                        &http_client,
+                        base_url,
+                        &token,
+                        message_id,
+                        key,
+                        "image",
+                    )
+                    .await
+                    {
+                        Ok(bytes) => {
+                            info!(
+                                "Feishu image downloaded: key={key}, size={}, idx={i}",
+                                bytes.len()
+                            );
+                            if i == 0 {
+                                let b64 = image_utils::base64_encode(&bytes);
+                                let media = image_utils::guess_image_media_type(&bytes);
+                                image_data = Some((b64, media));
+                            }
+                            // TODO: when LLM supports multiple images, pass all of them
+                        }
+                        Err(e) => {
+                            error!("Feishu: failed to download image {key}: {e}");
+                        }
                     }
                 }
             }

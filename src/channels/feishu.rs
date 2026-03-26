@@ -190,8 +190,8 @@ const FEISHU_CARD_MARKDOWN_MAX_BYTES: usize = 28_000;
 /// Build an interactive card JSON string with a single markdown element.
 /// Uses Card JSON 2.0 structure so that headings, tables, blockquotes,
 /// and inline code render correctly in Feishu.
-fn build_card_content(markdown: &str) -> String {
-    serde_json::json!({
+fn build_card_content(markdown: &str, title: Option<&str>) -> String {
+    let mut card = serde_json::json!({
         "schema": "2.0",
         "body": {
             "elements": [{
@@ -199,8 +199,14 @@ fn build_card_content(markdown: &str) -> String {
                 "content": markdown
             }]
         }
-    })
-    .to_string()
+    });
+    if let Some(t) = title {
+        card["header"] = serde_json::json!({
+            "title": { "tag": "plain_text", "content": t },
+            "template": "blue"
+        });
+    }
+    card.to_string()
 }
 
 /// Build the full message body for sending an interactive card message.
@@ -208,7 +214,7 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
     serde_json::json!({
         "receive_id": recipient,
         "msg_type": "interactive",
-        "content": build_card_content(markdown),
+        "content": build_card_content(markdown, None),
     })
 }
 
@@ -491,9 +497,16 @@ impl ChannelAdapter for FeishuAdapter {
                 ));
             }
         } else {
-            // Upload file
+            // Upload to /im/v1/files, then send with appropriate msg_type
+            let file_type = resolve_file_type(&ext);
+            let is_audio = matches!(
+                ext.as_str(),
+                "opus" | "ogg" | "mp3" | "wav" | "m4a" | "aac" | "flac"
+            );
+            let is_video = matches!(ext.as_str(), "mp4" | "mov" | "avi" | "mkv" | "webm");
+
             let form = reqwest::multipart::Form::new()
-                .text("file_type", resolve_file_type(&ext))
+                .text("file_type", file_type)
                 .text("file_name", filename.clone())
                 .part(
                     "file",
@@ -525,11 +538,28 @@ impl ChannelAdapter for FeishuAdapter {
                 .and_then(|v| v.as_str())
                 .ok_or("Missing file_key in upload response")?;
 
-            // Send file message
-            let content = serde_json::json!({ "file_key": file_key }).to_string();
+            // Choose msg_type: audio for inline playback, media for video, file for everything else
+            let (msg_type, content) = if is_audio {
+                (
+                    "audio",
+                    serde_json::json!({ "file_key": file_key }).to_string(),
+                )
+            } else if is_video {
+                // media messages require file_key + image_key (cover image); use empty string for no cover
+                (
+                    "media",
+                    serde_json::json!({ "file_key": file_key, "image_key": "" }).to_string(),
+                )
+            } else {
+                (
+                    "file",
+                    serde_json::json!({ "file_key": file_key }).to_string(),
+                )
+            };
+
             let body = serde_json::json!({
                 "receive_id": external_chat_id,
-                "msg_type": "file",
+                "msg_type": msg_type,
                 "content": content,
             });
             let send_url = format!(
@@ -543,11 +573,11 @@ impl ChannelAdapter for FeishuAdapter {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| format!("Failed to send Feishu file message: {e}"))?;
+                .map_err(|e| format!("Failed to send Feishu {msg_type} message: {e}"))?;
             let resp_json: serde_json::Value = resp
                 .json()
                 .await
-                .map_err(|e| format!("Failed to parse Feishu file send response: {e}"))?;
+                .map_err(|e| format!("Failed to parse Feishu {msg_type} send response: {e}"))?;
             let code = resp_json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
             if code != 0 {
                 let msg = resp_json
@@ -555,7 +585,7 @@ impl ChannelAdapter for FeishuAdapter {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 return Err(format!(
-                    "Feishu send file message error: code={code} msg={msg}"
+                    "Feishu send {msg_type} message error: code={code} msg={msg}"
                 ));
             }
         }

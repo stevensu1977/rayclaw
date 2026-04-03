@@ -7,6 +7,17 @@ description = "Multi-channel agentic AI runtime with tool-calling, memory, and s
 repository = "https://github.com/rayclaw/rayclaw"
 keywords = ["ai", "agent", "llm", "chatbot", "runtime"]
 categories = ["api-bindings", "asynchronous"]
+include = [
+    "/src/**/*",
+    "/web/dist/**/*",
+    "/rayclaw.data/**/*",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/SOUL.md",
+    "/build.rs",
+]
 
 [features]
 default = ["telegram", "discord", "slack", "feishu", "weixin", "web"]

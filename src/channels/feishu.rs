@@ -171,7 +171,7 @@ fn sanitize_filename(name: &str) -> String {
 // Domain resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_domain(domain: &str) -> String {
+pub(crate) fn resolve_domain(domain: &str) -> String {
     match domain {
         "feishu" => "https://open.feishu.cn".into(),
         "lark" => "https://open.larksuite.com".into(),
@@ -1100,7 +1100,7 @@ fn extract_service_id(url: &str) -> i32 {
 // Ensure token helper for standalone functions
 // ---------------------------------------------------------------------------
 
-async fn get_token(
+pub(crate) async fn get_token(
     http_client: &reqwest::Client,
     base_url: &str,
     app_id: &str,

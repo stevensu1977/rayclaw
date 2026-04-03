@@ -5,6 +5,7 @@ pub mod browser;
 pub mod command_runner;
 pub mod edit_file;
 pub mod export_chat;
+pub mod feishu_doc;
 pub mod glob;
 pub mod grep;
 pub mod mcp;
@@ -294,7 +295,7 @@ impl ToolRegistry {
             );
         }
         let skills_data_dir = config.skills_data_dir();
-        let tools: Vec<Box<dyn Tool>> = vec![
+        let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(bash::BashTool::new_with_isolation(
                 &config.working_dir,
                 config.working_dir_isolation,
@@ -373,6 +374,9 @@ impl ToolRegistry {
                 db.clone(),
             )),
         ];
+        if let Some(tool) = feishu_doc::FeishuDocTool::new(config) {
+            tools.push(Box::new(tool));
+        }
         ToolRegistry {
             tools,
             cached_definitions: OnceLock::new(),
@@ -393,7 +397,7 @@ impl ToolRegistry {
             );
         }
         let skills_data_dir = config.skills_data_dir();
-        let tools: Vec<Box<dyn Tool>> = vec![
+        let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(bash::BashTool::new_with_isolation(
                 &config.working_dir,
                 config.working_dir_isolation,
@@ -442,6 +446,9 @@ impl ToolRegistry {
                 db.clone(),
             )),
         ];
+        if let Some(tool) = feishu_doc::FeishuDocTool::new(config) {
+            tools.push(Box::new(tool));
+        }
         ToolRegistry {
             tools,
             cached_definitions: OnceLock::new(),

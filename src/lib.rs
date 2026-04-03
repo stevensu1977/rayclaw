@@ -10,6 +10,7 @@ pub mod db;
 pub mod doctor;
 pub mod embedding;
 pub mod error;
+pub mod error_classifier;
 pub mod gateway;
 pub mod image_utils;
 pub mod llm;

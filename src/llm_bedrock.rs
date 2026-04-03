@@ -851,7 +851,23 @@ impl LlmProvider for BedrockProvider {
 
         loop {
             let request = self.sign_and_build_request(&url, &body_bytes)?;
-            let response = request.send().await?;
+            let response = match request.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let classified = crate::error_classifier::classify_network(&e);
+                    if let Some(delay) = crate::error_classifier::retry_delay(
+                        classified.category,
+                        retries,
+                        max_retries,
+                    ) {
+                        retries += 1;
+                        warn!("Bedrock network error, retrying in {delay:?} (attempt {retries}/{max_retries}): {e}");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(RayClawError::LlmApi(classified.to_string()));
+                }
+            };
             let status = response.status();
 
             if status.is_success() {
@@ -859,21 +875,23 @@ impl LlmProvider for BedrockProvider {
                 return Ok(translate_bedrock_response(&response_body));
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let status_code = status.as_u16();
+            let err_body = response.text().await.unwrap_or_default();
+            let classified = crate::error_classifier::classify_http(status_code, &err_body);
+
+            if let Some(delay) =
+                crate::error_classifier::retry_delay(classified.category, retries, max_retries)
+            {
                 retries += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Bedrock rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
-                    delay
+                    "Bedrock {}, retrying in {delay:?} (attempt {retries}/{max_retries})",
+                    classified
                 );
                 tokio::time::sleep(delay).await;
                 continue;
             }
 
-            let err_body = response.text().await.unwrap_or_default();
-            return Err(RayClawError::LlmApi(format!(
-                "Bedrock Converse HTTP {status}: {err_body}"
-            )));
+            return Err(RayClawError::LlmApi(classified.to_string()));
         }
     }
 

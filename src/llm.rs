@@ -344,18 +344,24 @@ impl AnthropicProvider {
             req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
         }
 
-        let response = req.json(&body).send().await?;
+        let response = req.json(&body).send().await.map_err(|e| {
+            RayClawError::LlmApi(crate::error_classifier::classify_network(&e).to_string())
+        })?;
 
         let status = response.status();
         if !status.is_success() {
+            let status_code = status.as_u16();
             let body = response.text().await.unwrap_or_default();
-            if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
-                return Err(RayClawError::LlmApi(format!(
-                    "{}: {}",
-                    api_err.error.error_type, api_err.error.message
-                )));
-            }
-            return Err(RayClawError::LlmApi(format!("HTTP {status}: {body}")));
+            let classified = if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
+                crate::error_classifier::classify_anthropic(
+                    status_code,
+                    &api_err.error.error_type,
+                    &api_err.error.message,
+                )
+            } else {
+                crate::error_classifier::classify_http(status_code, &body)
+            };
+            return Err(RayClawError::LlmApi(classified.to_string()));
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -748,7 +754,23 @@ impl LlmProvider for AnthropicProvider {
                 req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
             }
 
-            let response = req.json(&body).send().await?;
+            let response = match req.json(&body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let classified = crate::error_classifier::classify_network(&e);
+                    if let Some(delay) = crate::error_classifier::retry_delay(
+                        classified.category,
+                        retries,
+                        max_retries,
+                    ) {
+                        retries += 1;
+                        warn!("Anthropic network error, retrying in {delay:?} (attempt {retries}/{max_retries}): {e}");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(RayClawError::LlmApi(classified.to_string()));
+                }
+            };
 
             let status = response.status();
 
@@ -760,25 +782,31 @@ impl LlmProvider for AnthropicProvider {
                 return Ok(parsed);
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let status_code = status.as_u16();
+            let body = response.text().await.unwrap_or_default();
+            let classified = if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
+                crate::error_classifier::classify_anthropic(
+                    status_code,
+                    &api_err.error.error_type,
+                    &api_err.error.message,
+                )
+            } else {
+                crate::error_classifier::classify_http(status_code, &body)
+            };
+
+            if let Some(delay) =
+                crate::error_classifier::retry_delay(classified.category, retries, max_retries)
+            {
                 retries += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
-                    delay
+                    "Anthropic {}, retrying in {delay:?} (attempt {retries}/{max_retries})",
+                    classified
                 );
                 tokio::time::sleep(delay).await;
                 continue;
             }
 
-            let body = response.text().await.unwrap_or_default();
-            if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
-                return Err(RayClawError::LlmApi(format!(
-                    "{}: {}",
-                    api_err.error.error_type, api_err.error.message
-                )));
-            }
-            return Err(RayClawError::LlmApi(format!("HTTP {status}: {body}")));
+            return Err(RayClawError::LlmApi(classified.to_string()));
         }
     }
 
@@ -984,7 +1012,23 @@ impl LlmProvider for OpenAiProvider {
             if !self.api_key.trim().is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", self.api_key));
             }
-            let response = req.send().await?;
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let classified = crate::error_classifier::classify_network(&e);
+                    if let Some(delay) = crate::error_classifier::retry_delay(
+                        classified.category,
+                        retries,
+                        max_retries,
+                    ) {
+                        retries += 1;
+                        warn!("OpenAI network error, retrying in {delay:?} (attempt {retries}/{max_retries}): {e}");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(RayClawError::LlmApi(classified.to_string()));
+                }
+            };
 
             let status = response.status();
 
@@ -998,22 +1042,23 @@ impl LlmProvider for OpenAiProvider {
                 return Ok(translate_oai_response(oai));
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            let status_code = status.as_u16();
+            let text = response.text().await.unwrap_or_default();
+            let classified = crate::error_classifier::classify_http(status_code, &text);
+
+            if let Some(delay) =
+                crate::error_classifier::retry_delay(classified.category, retries, max_retries)
+            {
                 retries += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(retries));
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
-                    delay
+                    "OpenAI {}, retrying in {delay:?} (attempt {retries}/{max_retries})",
+                    classified
                 );
                 tokio::time::sleep(delay).await;
                 continue;
             }
 
-            let text = response.text().await.unwrap_or_default();
-            if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
-                return Err(RayClawError::LlmApi(err.error.message));
-            }
-            return Err(RayClawError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(RayClawError::LlmApi(classified.to_string()));
         }
     }
 

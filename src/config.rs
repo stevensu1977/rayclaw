@@ -30,6 +30,12 @@ fn default_max_tokens() -> u32 {
 fn default_max_tool_iterations() -> usize {
     100
 }
+fn default_max_loop_repeats() -> usize {
+    3
+}
+fn default_llm_idle_timeout_secs() -> u64 {
+    30
+}
 fn default_max_history_messages() -> usize {
     50
 }
@@ -139,6 +145,10 @@ pub struct Config {
     pub prompt_cache_ttl: String,
     #[serde(default = "default_max_tool_iterations")]
     pub max_tool_iterations: usize,
+    #[serde(default = "default_max_loop_repeats")]
+    pub max_loop_repeats: usize,
+    #[serde(default = "default_llm_idle_timeout_secs")]
+    pub llm_idle_timeout_secs: u64,
     #[serde(default = "default_max_history_messages")]
     pub max_history_messages: usize,
     #[serde(default = "default_max_document_size_mb")]
@@ -608,6 +618,8 @@ mod tests {
             max_tokens: 8192,
             prompt_cache_ttl: "none".into(),
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,

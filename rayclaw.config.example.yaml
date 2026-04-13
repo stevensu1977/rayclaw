@@ -101,6 +101,7 @@ compact_keep_recent: 20         # messages to keep verbatim after compaction
 #   weixin:
 #     bot_token: ""                  # Bearer token from QR login
 #     base_url: "https://ilinkai.weixin.qq.com"   # default
+#     cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c"  # CDN for file upload
 #     route_tag: ""                  # optional SKRouteTag header
 
 # ── Web UI ──────────────────────────────────────────

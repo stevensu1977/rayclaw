@@ -1,6 +1,6 @@
 [package]
 name = "rayclaw"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 description = "Multi-channel agentic AI runtime with tool-calling, memory, and scheduling"
@@ -67,6 +67,10 @@ crc32fast = "1"
 sqlite-vec = { version = "0.1.7-alpha.10", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 qrcode = "0.14"
+aes = "0.8"
+cipher = { version = "0.4", features = ["alloc", "block-padding"] }
+ecb = "0.1"
+md-5 = "0.10"
 
 [dev-dependencies]
 tower = "0.5"

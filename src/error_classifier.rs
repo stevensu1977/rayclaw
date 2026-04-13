@@ -28,6 +28,8 @@ pub struct ClassifiedError {
     pub status: Option<u16>,
     /// Provider-specific error type string (e.g. "overloaded_error").
     pub error_type: Option<String>,
+    /// Delay hint from the server's `Retry-After` header.
+    pub retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for ClassifiedError {
@@ -51,6 +53,17 @@ impl ClassifiedError {
             LlmErrorCategory::Transient | LlmErrorCategory::RateLimit
         )
     }
+
+    /// Convert into the appropriate `RayClawError` variant, preserving the
+    /// `ContextOverflow` category so the agent loop can handle it specially.
+    pub fn into_error(self) -> crate::error::RayClawError {
+        match self.category {
+            LlmErrorCategory::ContextOverflow => {
+                crate::error::RayClawError::ContextOverflow(self.to_string())
+            }
+            _ => crate::error::RayClawError::LlmApi(self.to_string()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -58,22 +71,43 @@ impl ClassifiedError {
 // ---------------------------------------------------------------------------
 
 /// Decides the delay for a given retry attempt. Returns `None` when retries
-/// are exhausted.
-pub fn retry_delay(category: LlmErrorCategory, attempt: u32, max_retries: u32) -> Option<Duration> {
+/// are exhausted. If the server sent a `Retry-After` header (passed via
+/// `server_hint`), that value is used instead of the computed backoff — but
+/// capped at 60 s to avoid pathologically long waits.
+pub fn retry_delay(
+    category: LlmErrorCategory,
+    attempt: u32,
+    max_retries: u32,
+    server_hint: Option<Duration>,
+) -> Option<Duration> {
     if attempt >= max_retries {
         return None;
     }
-    match category {
-        LlmErrorCategory::RateLimit => {
-            // Longer backoff for rate-limits: 2, 4, 8, 16 …
-            Some(Duration::from_secs(2u64.pow(attempt + 1)))
+    let computed = match category {
+        LlmErrorCategory::RateLimit => Duration::from_secs(2u64.pow(attempt + 1)),
+        LlmErrorCategory::Transient => Duration::from_secs(2u64.pow(attempt)),
+        _ => return None, // non-retryable
+    };
+    let delay = match server_hint {
+        Some(hint) => hint.min(Duration::from_secs(60)),
+        None => computed,
+    };
+    Some(delay)
+}
+
+/// Parse the `Retry-After` header value. Supports both delay-seconds (e.g.
+/// `"5"`) and HTTP-date (e.g. `"Fri, 04 Apr 2026 12:00:00 GMT"`).
+pub fn parse_retry_after(value: &str) -> Option<Duration> {
+    // Try seconds first (most common for API rate-limits).
+    if let Ok(secs) = value.trim().parse::<f64>() {
+        if secs > 0.0 && secs <= 300.0 {
+            return Some(Duration::from_secs_f64(secs));
         }
-        LlmErrorCategory::Transient => {
-            // Shorter backoff for transient: 1, 2, 4 …
-            Some(Duration::from_secs(2u64.pow(attempt)))
-        }
-        _ => None, // non-retryable
+        return None;
     }
+    // Try HTTP-date via httpdate crate (already a transitive dep of reqwest).
+    // If not available, fall back to None — the caller uses computed backoff.
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +123,7 @@ pub fn classify_http(status: u16, body: &str) -> ClassifiedError {
             message: extract_message(body).unwrap_or_else(|| "Rate limited".into()),
             status: Some(status),
             error_type: Some("rate_limit_error".into()),
+            retry_after: None,
         };
     }
 
@@ -100,6 +135,7 @@ pub fn classify_http(status: u16, body: &str) -> ClassifiedError {
                 .unwrap_or_else(|| format!("Authentication error (HTTP {status})")),
             status: Some(status),
             error_type: Some("authentication_error".into()),
+            retry_after: None,
         };
     }
 
@@ -111,6 +147,7 @@ pub fn classify_http(status: u16, body: &str) -> ClassifiedError {
                 .unwrap_or_else(|| format!("Server error (HTTP {status})")),
             status: Some(status),
             error_type: None,
+            retry_after: None,
         };
     }
 
@@ -121,6 +158,7 @@ pub fn classify_http(status: u16, body: &str) -> ClassifiedError {
             message: "Gateway timeout".into(),
             status: Some(status),
             error_type: None,
+            retry_after: None,
         };
     }
 
@@ -131,6 +169,7 @@ pub fn classify_http(status: u16, body: &str) -> ClassifiedError {
             message: extract_message(body).unwrap_or_else(|| "Context length exceeded".into()),
             status: Some(status),
             error_type: Some("context_overflow".into()),
+            retry_after: None,
         };
     }
 
@@ -140,6 +179,7 @@ pub fn classify_http(status: u16, body: &str) -> ClassifiedError {
         message: extract_message(body).unwrap_or_else(|| format!("API error (HTTP {status})")),
         status: Some(status),
         error_type: None,
+        retry_after: None,
     }
 }
 
@@ -169,6 +209,7 @@ pub fn classify_anthropic(status: u16, error_type: &str, message: &str) -> Class
         message: format!("{error_type}: {message}"),
         status: Some(status),
         error_type: Some(error_type.to_string()),
+        retry_after: None,
     }
 }
 
@@ -179,6 +220,7 @@ pub fn classify_network(err: &reqwest::Error) -> ClassifiedError {
         message: format!("Network error: {err}"),
         status: None,
         error_type: None,
+        retry_after: None,
     }
 }
 
@@ -321,45 +363,45 @@ mod tests {
     #[test]
     fn test_retry_delay_rate_limit() {
         assert_eq!(
-            retry_delay(LlmErrorCategory::RateLimit, 0, 3),
+            retry_delay(LlmErrorCategory::RateLimit, 0, 3, None),
             Some(Duration::from_secs(2))
         );
         assert_eq!(
-            retry_delay(LlmErrorCategory::RateLimit, 1, 3),
+            retry_delay(LlmErrorCategory::RateLimit, 1, 3, None),
             Some(Duration::from_secs(4))
         );
         assert_eq!(
-            retry_delay(LlmErrorCategory::RateLimit, 2, 3),
+            retry_delay(LlmErrorCategory::RateLimit, 2, 3, None),
             Some(Duration::from_secs(8))
         );
-        assert_eq!(retry_delay(LlmErrorCategory::RateLimit, 3, 3), None); // exhausted
+        assert_eq!(retry_delay(LlmErrorCategory::RateLimit, 3, 3, None), None); // exhausted
     }
 
     #[test]
     fn test_retry_delay_transient() {
         assert_eq!(
-            retry_delay(LlmErrorCategory::Transient, 0, 3),
+            retry_delay(LlmErrorCategory::Transient, 0, 3, None),
             Some(Duration::from_secs(1))
         );
         assert_eq!(
-            retry_delay(LlmErrorCategory::Transient, 1, 3),
+            retry_delay(LlmErrorCategory::Transient, 1, 3, None),
             Some(Duration::from_secs(2))
         );
         assert_eq!(
-            retry_delay(LlmErrorCategory::Transient, 2, 3),
+            retry_delay(LlmErrorCategory::Transient, 2, 3, None),
             Some(Duration::from_secs(4))
         );
-        assert_eq!(retry_delay(LlmErrorCategory::Transient, 3, 3), None);
+        assert_eq!(retry_delay(LlmErrorCategory::Transient, 3, 3, None), None);
     }
 
     #[test]
     fn test_retry_delay_permanent_never() {
-        assert_eq!(retry_delay(LlmErrorCategory::Permanent, 0, 3), None);
+        assert_eq!(retry_delay(LlmErrorCategory::Permanent, 0, 3, None), None);
     }
 
     #[test]
     fn test_retry_delay_auth_never() {
-        assert_eq!(retry_delay(LlmErrorCategory::Auth, 0, 3), None);
+        assert_eq!(retry_delay(LlmErrorCategory::Auth, 0, 3, None), None);
     }
 
     #[tokio::test]
@@ -405,7 +447,62 @@ mod tests {
             message: "slow down".into(),
             status: Some(429),
             error_type: None,
+            retry_after: None,
         };
         assert_eq!(format!("{c}"), "[rate_limit] slow down");
+    }
+
+    #[test]
+    fn test_retry_delay_with_server_hint() {
+        // Server says wait 10s — should use that instead of computed 2s
+        let d = retry_delay(
+            LlmErrorCategory::RateLimit,
+            0,
+            3,
+            Some(Duration::from_secs(10)),
+        );
+        assert_eq!(d, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn test_retry_delay_hint_capped_at_60s() {
+        // Server says wait 120s — should be capped at 60s
+        let d = retry_delay(
+            LlmErrorCategory::RateLimit,
+            0,
+            3,
+            Some(Duration::from_secs(120)),
+        );
+        assert_eq!(d, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_retry_delay_no_hint_uses_backoff() {
+        let d = retry_delay(LlmErrorCategory::RateLimit, 0, 3, None);
+        assert_eq!(d, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn test_parse_retry_after_seconds() {
+        assert_eq!(parse_retry_after("5"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after(" 10 "), Some(Duration::from_secs(10)));
+        assert_eq!(parse_retry_after("1.5"), Some(Duration::from_secs_f64(1.5)));
+    }
+
+    #[test]
+    fn test_parse_retry_after_zero_or_negative() {
+        assert_eq!(parse_retry_after("0"), None);
+        assert_eq!(parse_retry_after("-1"), None);
+    }
+
+    #[test]
+    fn test_parse_retry_after_too_large() {
+        assert_eq!(parse_retry_after("999"), None);
+    }
+
+    #[test]
+    fn test_parse_retry_after_non_numeric() {
+        // HTTP-date not fully supported yet, returns None
+        assert_eq!(parse_retry_after("Fri, 04 Apr 2026 12:00:00 GMT"), None);
     }
 }

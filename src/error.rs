@@ -6,6 +6,9 @@ pub enum RayClawError {
     #[error("LLM API error: {0}")]
     LlmApi(String),
 
+    #[error("Context overflow: {0}")]
+    ContextOverflow(String),
+
     #[error("Rate limited, retry after backoff")]
     RateLimited,
 

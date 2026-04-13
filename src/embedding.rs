@@ -224,6 +224,8 @@ mod tests {
             max_tokens: 8192,
             prompt_cache_ttl: "none".into(),
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,

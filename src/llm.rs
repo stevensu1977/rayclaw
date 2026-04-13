@@ -250,6 +250,7 @@ pub struct AnthropicProvider {
     max_tokens: u32,
     base_url: String,
     prompt_cache_ttl: String,
+    idle_timeout: std::time::Duration,
 }
 
 impl AnthropicProvider {
@@ -261,6 +262,7 @@ impl AnthropicProvider {
             max_tokens: config.max_tokens,
             base_url: resolve_anthropic_messages_url(config.llm_base_url.as_deref().unwrap_or("")),
             prompt_cache_ttl: config.prompt_cache_ttl.clone(),
+            idle_timeout: std::time::Duration::from_secs(config.llm_idle_timeout_secs.max(5)),
         }
     }
 
@@ -361,7 +363,7 @@ impl AnthropicProvider {
             } else {
                 crate::error_classifier::classify_http(status_code, &body)
             };
-            return Err(RayClawError::LlmApi(classified.to_string()));
+            return Err(classified.into_error());
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -374,7 +376,19 @@ impl AnthropicProvider {
             std::collections::HashMap::new();
         let mut ordered_indexes: Vec<usize> = Vec::new();
 
-        'outer: while let Some(chunk_res) = byte_stream.next().await {
+        let idle_timeout = self.idle_timeout;
+        'outer: loop {
+            let chunk_res = match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
+                Ok(Some(res)) => res,
+                Ok(None) => break,
+                Err(_) => {
+                    warn!("Anthropic streaming idle timeout after {:?}", idle_timeout);
+                    return Err(RayClawError::LlmApi(format!(
+                        "Streaming idle timeout: no data received for {:?}",
+                        idle_timeout
+                    )));
+                }
+            };
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(_) => break,
@@ -762,13 +776,14 @@ impl LlmProvider for AnthropicProvider {
                         classified.category,
                         retries,
                         max_retries,
+                        None,
                     ) {
                         retries += 1;
                         warn!("Anthropic network error, retrying in {delay:?} (attempt {retries}/{max_retries}): {e}");
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(RayClawError::LlmApi(classified.to_string()));
+                    return Err(classified.into_error());
                 }
             };
 
@@ -783,20 +798,30 @@ impl LlmProvider for AnthropicProvider {
             }
 
             let status_code = status.as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::error_classifier::parse_retry_after);
             let body = response.text().await.unwrap_or_default();
-            let classified = if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
-                crate::error_classifier::classify_anthropic(
-                    status_code,
-                    &api_err.error.error_type,
-                    &api_err.error.message,
-                )
-            } else {
-                crate::error_classifier::classify_http(status_code, &body)
-            };
+            let mut classified =
+                if let Ok(api_err) = serde_json::from_str::<AnthropicApiError>(&body) {
+                    crate::error_classifier::classify_anthropic(
+                        status_code,
+                        &api_err.error.error_type,
+                        &api_err.error.message,
+                    )
+                } else {
+                    crate::error_classifier::classify_http(status_code, &body)
+                };
+            classified.retry_after = retry_after;
 
-            if let Some(delay) =
-                crate::error_classifier::retry_delay(classified.category, retries, max_retries)
-            {
+            if let Some(delay) = crate::error_classifier::retry_delay(
+                classified.category,
+                retries,
+                max_retries,
+                classified.retry_after,
+            ) {
                 retries += 1;
                 warn!(
                     "Anthropic {}, retrying in {delay:?} (attempt {retries}/{max_retries})",
@@ -806,7 +831,7 @@ impl LlmProvider for AnthropicProvider {
                 continue;
             }
 
-            return Err(RayClawError::LlmApi(classified.to_string()));
+            return Err(classified.into_error());
         }
     }
 
@@ -837,6 +862,7 @@ pub struct OpenAiProvider {
     is_openai_codex: bool,
     chat_url: String,
     responses_url: String,
+    idle_timeout: std::time::Duration,
 }
 
 fn resolve_openai_compat_base(provider: &str, configured_base: &str) -> String {
@@ -883,6 +909,7 @@ impl OpenAiProvider {
             is_openai_codex,
             chat_url: format!("{}/chat/completions", base.trim_end_matches('/')),
             responses_url: format!("{}/responses", base.trim_end_matches('/')),
+            idle_timeout: std::time::Duration::from_secs(config.llm_idle_timeout_secs.max(5)),
         }
     }
 }
@@ -1020,13 +1047,14 @@ impl LlmProvider for OpenAiProvider {
                         classified.category,
                         retries,
                         max_retries,
+                        None,
                     ) {
                         retries += 1;
                         warn!("OpenAI network error, retrying in {delay:?} (attempt {retries}/{max_retries}): {e}");
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(RayClawError::LlmApi(classified.to_string()));
+                    return Err(classified.into_error());
                 }
             };
 
@@ -1043,12 +1071,21 @@ impl LlmProvider for OpenAiProvider {
             }
 
             let status_code = status.as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::error_classifier::parse_retry_after);
             let text = response.text().await.unwrap_or_default();
-            let classified = crate::error_classifier::classify_http(status_code, &text);
+            let mut classified = crate::error_classifier::classify_http(status_code, &text);
+            classified.retry_after = retry_after;
 
-            if let Some(delay) =
-                crate::error_classifier::retry_delay(classified.category, retries, max_retries)
-            {
+            if let Some(delay) = crate::error_classifier::retry_delay(
+                classified.category,
+                retries,
+                max_retries,
+                classified.retry_after,
+            ) {
                 retries += 1;
                 warn!(
                     "OpenAI {}, retrying in {delay:?} (attempt {retries}/{max_retries})",
@@ -1058,7 +1095,7 @@ impl LlmProvider for OpenAiProvider {
                 continue;
             }
 
-            return Err(RayClawError::LlmApi(classified.to_string()));
+            return Err(classified.into_error());
         }
     }
 
@@ -1129,7 +1166,19 @@ impl LlmProvider for OpenAiProvider {
         let mut tool_calls: std::collections::BTreeMap<usize, StreamToolUseBlock> =
             std::collections::BTreeMap::new();
 
-        'outer: while let Some(chunk_res) = byte_stream.next().await {
+        let idle_timeout = self.idle_timeout;
+        'outer: loop {
+            let chunk_res = match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
+                Ok(Some(res)) => res,
+                Ok(None) => break,
+                Err(_) => {
+                    warn!("OpenAI streaming idle timeout after {:?}", idle_timeout);
+                    return Err(RayClawError::LlmApi(format!(
+                        "Streaming idle timeout: no data received for {:?}",
+                        idle_timeout
+                    )));
+                }
+            };
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(_) => break,
@@ -2136,6 +2185,8 @@ mod tests {
             max_tokens: 8192,
             prompt_cache_ttl: "none".into(),
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,
@@ -2194,6 +2245,8 @@ mod tests {
             max_tokens: 8192,
             prompt_cache_ttl: "none".into(),
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,
@@ -2317,6 +2370,8 @@ mod tests {
             max_tokens: 8192,
             prompt_cache_ttl: "none".into(),
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,
@@ -2479,6 +2534,8 @@ mod tests {
             max_tokens: 8192,
             prompt_cache_ttl: "none".into(),
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,
@@ -2855,6 +2912,7 @@ data: [DONE]
             max_tokens: 4096,
             base_url: "https://api.anthropic.com/v1/messages".into(),
             prompt_cache_ttl: cache_ttl.into(),
+            idle_timeout: std::time::Duration::from_secs(30),
         }
     }
 
@@ -2966,5 +3024,49 @@ data: [DONE]
         assert!(tools_arr[0].get("cache_control").is_none());
         // Only last tool should have cache_control
         assert_eq!(tools_arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    // -----------------------------------------------------------------------
+    // Idle timeout config tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_idle_timeout_default_30s() {
+        let provider = make_anthropic_provider("none");
+        assert_eq!(provider.idle_timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_idle_timeout_minimum_enforced() {
+        // Provider constructor clamps at 5s minimum via .max(5)
+        let yaml =
+            "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_idle_timeout_secs: 1\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let provider = AnthropicProvider::new(&config);
+        assert_eq!(provider.idle_timeout, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_idle_timeout_custom_value() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_idle_timeout_secs: 120\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.llm_idle_timeout_secs, 120);
+        let provider = AnthropicProvider::new(&config);
+        assert_eq!(provider.idle_timeout, std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_idle_timeout_openai_provider() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nllm_provider: openai\nllm_idle_timeout_secs: 45\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let provider = OpenAiProvider::new(&config);
+        assert_eq!(provider.idle_timeout, std::time::Duration::from_secs(45));
+    }
+
+    #[test]
+    fn test_idle_timeout_yaml_default() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.llm_idle_timeout_secs, 30);
     }
 }

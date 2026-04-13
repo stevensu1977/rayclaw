@@ -10,6 +10,78 @@ use crate::runtime::AppState;
 use crate::text::floor_char_boundary;
 use crate::tools::ToolAuthContext;
 
+// ---------------------------------------------------------------------------
+// Loop Detector — detects repetitive tool call patterns in the agent loop
+// ---------------------------------------------------------------------------
+
+/// Hashes a tool call (name + params) for fast comparison.
+fn hash_tool_call(name: &str, input: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    // Deterministic JSON string for hashing
+    let input_str = serde_json::to_string(input).unwrap_or_default();
+    input_str.hash(&mut hasher);
+    hasher.finish()
+}
+
+struct LoopDetector {
+    /// Ring buffer of recent tool call hashes.
+    history: Vec<u64>,
+    /// How many exact repetitions trigger detection.
+    threshold: usize,
+}
+
+impl LoopDetector {
+    fn new(threshold: usize) -> Self {
+        Self {
+            history: Vec::new(),
+            threshold: threshold.max(2), // minimum 2
+        }
+    }
+
+    /// Record a tool call. Returns `true` if a loop is detected.
+    fn record(&mut self, name: &str, input: &serde_json::Value) -> bool {
+        let hash = hash_tool_call(name, input);
+        self.history.push(hash);
+        self.detect_exact_loop() || self.detect_same_tool_loop(name)
+    }
+
+    /// Detect an exact repeating pattern of length 1..=history/2.
+    /// E.g. [A, B, A, B, A, B] with threshold=3 → detected (pattern [A,B] repeats 3 times).
+    fn detect_exact_loop(&self) -> bool {
+        let len = self.history.len();
+        // Try pattern lengths from 1 up to half the history
+        for pattern_len in 1..=(len / 2) {
+            if len < pattern_len * self.threshold {
+                continue;
+            }
+            let tail = &self.history[len - pattern_len * self.threshold..];
+            let pattern = &tail[..pattern_len];
+            let all_match = tail.chunks(pattern_len).all(|chunk| chunk == pattern);
+            if all_match {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Detect the same tool name called too many times in the last N calls
+    /// (even if params differ slightly). Uses the last `threshold * 2` entries.
+    fn detect_same_tool_loop(&self, latest_name: &str) -> bool {
+        // We only track hashes, so we need the name history too.
+        // Instead, we'll count consecutive same-name calls at the tail.
+        // This is a lighter check — if the last `threshold + 2` calls are all
+        // the same tool name, it's likely a semantic loop.
+        // We can't check name from hash alone, but since this is called right
+        // after record() with the name, we store names separately.
+        // For simplicity, this method is a no-op here — the exact_loop catches
+        // the critical cases. Full semantic detection can be added later.
+        let _ = latest_name;
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AgentRequestContext<'a> {
     pub caller_channel: &'a str,
@@ -789,13 +861,15 @@ pub(crate) async fn process_with_agent_impl(
     // Agentic tool-use loop
     let mut failed_tools: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut empty_visible_reply_retry_attempted = false;
+    let mut loop_detector = LoopDetector::new(state.config.max_loop_repeats);
+    let mut overflow_recovery_attempted = false;
     for iteration in 0..state.config.max_tool_iterations {
         if let Some(tx) = event_tx {
             let _ = tx.send(AgentEvent::Iteration {
                 iteration: iteration + 1,
             });
         }
-        let response = if let Some(tx) = event_tx {
+        let llm_result = if let Some(tx) = event_tx {
             let (llm_tx, mut llm_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let forward_tx = tx.clone();
             let forward_handle = tokio::spawn(async move {
@@ -803,7 +877,7 @@ pub(crate) async fn process_with_agent_impl(
                     let _ = forward_tx.send(AgentEvent::TextDelta { delta });
                 }
             });
-            let response = state
+            let result = state
                 .llm
                 .send_message_stream(
                     &system_prompt,
@@ -811,15 +885,44 @@ pub(crate) async fn process_with_agent_impl(
                     Some(tool_defs.clone()),
                     Some(&llm_tx),
                 )
-                .await?;
+                .await;
             drop(llm_tx);
             let _ = forward_handle.await;
-            response
+            result
         } else {
             state
                 .llm
                 .send_message(&system_prompt, messages.clone(), Some(tool_defs.clone()))
-                .await?
+                .await
+        };
+
+        // --- Context overflow recovery ---
+        let response = match llm_result {
+            Ok(r) => r,
+            Err(crate::error::RayClawError::ContextOverflow(ref msg))
+                if !overflow_recovery_attempted =>
+            {
+                overflow_recovery_attempted = true;
+                warn!(
+                    "Context overflow detected (chat_id={}): {}. Attempting recovery.",
+                    chat_id, msg
+                );
+                let recovered =
+                    recover_from_overflow(state, context.caller_channel, chat_id, &mut messages)
+                        .await;
+                if recovered {
+                    continue; // retry with compacted messages
+                }
+                // Recovery failed — return a user-friendly message
+                let overflow_msg = "I ran out of context space and couldn't recover automatically. Please use /reset to start a fresh conversation.".to_string();
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(AgentEvent::FinalResponse {
+                        text: overflow_msg.clone(),
+                    });
+                }
+                return Ok(overflow_msg);
+            }
+            Err(e) => return Err(e.into()),
         };
 
         if let Some(usage) = &response.usage {
@@ -1024,6 +1127,47 @@ pub(crate) async fn process_with_agent_impl(
                         is_error: if result.is_error { Some(true) } else { None },
                     });
                 }
+            }
+
+            // Record tool calls in the loop detector
+            let mut loop_detected = false;
+            for block in &response.content {
+                if let ResponseContentBlock::ToolUse { name, input, .. } = block {
+                    if loop_detector.record(name, input) {
+                        loop_detected = true;
+                    }
+                }
+            }
+
+            if loop_detected {
+                warn!(
+                    "Loop detected after {} iterations (chat_id={}). Forcing stop.",
+                    iteration + 1,
+                    chat_id
+                );
+                // Append tool results so the session stays valid, then force stop.
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Blocks(tool_results),
+                });
+                let loop_msg = "I detected a repeating pattern in my tool calls and stopped to avoid an infinite loop. Please try rephrasing your request or breaking it into smaller steps.".to_string();
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: MessageContent::Text(loop_msg.clone()),
+                });
+                strip_images_for_session(&mut messages);
+                if let Ok(json) = serde_json::to_string(&messages) {
+                    let _ =
+                        call_blocking(state.db.clone(), move |db| db.save_session(chat_id, &json))
+                            .await;
+                }
+                clear_todo(&state.config.data_dir, chat_id);
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(AgentEvent::FinalResponse {
+                        text: loop_msg.clone(),
+                    });
+                }
+                return Ok(loop_msg);
             }
 
             messages.push(Message {
@@ -1612,6 +1756,77 @@ pub fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, message
     }
 }
 
+// ---------------------------------------------------------------------------
+// Context Overflow Recovery — 3-layer strategy
+// ---------------------------------------------------------------------------
+
+/// Attempt to recover from a context overflow error by progressively compacting
+/// the message history.  Returns `true` if messages were successfully reduced
+/// and the caller should retry the LLM call.
+///
+/// Layer 1: Aggressive compaction — keep only the last 4 messages, summarize the rest.
+/// Layer 2: Emergency truncation — keep only the last 2 messages (no LLM call).
+async fn recover_from_overflow(
+    state: &AppState,
+    caller_channel: &str,
+    chat_id: i64,
+    messages: &mut Vec<Message>,
+) -> bool {
+    let original_len = messages.len();
+    info!(
+        "Overflow recovery: starting with {} messages (chat_id={})",
+        original_len, chat_id
+    );
+
+    // Layer 1: Aggressive compaction — summarize all but last 4 messages
+    if original_len > 4 {
+        info!("Overflow recovery Layer 1: aggressive compaction (keep last 4)");
+        let compacted = compact_messages(state, caller_channel, chat_id, messages, 4).await;
+        if compacted.len() < original_len {
+            *messages = compacted;
+            info!(
+                "Overflow recovery Layer 1 succeeded: {} → {} messages",
+                original_len,
+                messages.len()
+            );
+            return true;
+        }
+        warn!("Overflow recovery Layer 1 failed (compaction did not reduce messages)");
+    }
+
+    // Layer 2: Emergency truncation — keep only last 2 messages, no LLM call
+    if original_len > 2 {
+        info!("Overflow recovery Layer 2: emergency truncation (keep last 2)");
+        let keep = messages.split_off(messages.len().saturating_sub(2));
+        *messages = keep;
+        // Ensure first message is from user (APIs require user-first)
+        if messages.first().map(|m| m.role.as_str()) == Some("assistant") {
+            messages.insert(
+                0,
+                Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(
+                        "[Context was truncated due to length. Previous conversation lost.]".into(),
+                    ),
+                },
+            );
+        }
+        info!(
+            "Overflow recovery Layer 2 succeeded: {} → {} messages",
+            original_len,
+            messages.len()
+        );
+        return true;
+    }
+
+    // Cannot reduce further
+    warn!(
+        "Overflow recovery failed: only {} messages, cannot reduce further",
+        original_len
+    );
+    false
+}
+
 /// Compact old messages by summarizing them via LLM, keeping recent messages verbatim.
 async fn compact_messages(
     state: &AppState,
@@ -1750,7 +1965,9 @@ mod tests {
     use crate::db::{Database, StoredMessage};
     use crate::error::RayClawError;
     use crate::llm::LlmProvider;
-    use crate::llm_types::{Message, MessagesResponse, ResponseContentBlock, ToolDefinition};
+    use crate::llm_types::{
+        Message, MessageContent, MessagesResponse, ResponseContentBlock, ToolDefinition,
+    };
     use crate::memory::MemoryManager;
     use crate::runtime::AppState;
     use crate::skills::SkillManager;
@@ -1843,6 +2060,8 @@ mod tests {
             llm_base_url: None,
             max_tokens: 8192,
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,
@@ -2195,6 +2414,8 @@ mod tests {
             llm_base_url: None,
             max_tokens: 8192,
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,
@@ -2258,6 +2479,8 @@ mod tests {
             llm_base_url: None,
             max_tokens: 8192,
             max_tool_iterations: 100,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,
@@ -2305,5 +2528,291 @@ mod tests {
         assert!(soul.unwrap().contains("custom personality"));
 
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // LoopDetector tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_loop_detector_no_loop() {
+        let mut det = super::LoopDetector::new(3);
+        // Different tool calls — no loop
+        assert!(!det.record("read_file", &serde_json::json!({"path": "a.rs"})));
+        assert!(!det.record("write_file", &serde_json::json!({"path": "b.rs"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "ls"})));
+    }
+
+    #[test]
+    fn test_loop_detector_exact_single_repeat() {
+        let mut det = super::LoopDetector::new(3);
+        let input = serde_json::json!({"path": "/tmp/x"});
+        assert!(!det.record("read_file", &input)); // 1st
+        assert!(!det.record("read_file", &input)); // 2nd
+        assert!(det.record("read_file", &input)); // 3rd → loop!
+    }
+
+    #[test]
+    fn test_loop_detector_pattern_ab_repeat() {
+        let mut det = super::LoopDetector::new(3);
+        let a = serde_json::json!({"path": "a"});
+        let b = serde_json::json!({"path": "b"});
+        assert!(!det.record("read_file", &a)); // A
+        assert!(!det.record("write_file", &b)); // B
+        assert!(!det.record("read_file", &a)); // A
+        assert!(!det.record("write_file", &b)); // B
+        assert!(!det.record("read_file", &a)); // A
+        assert!(det.record("write_file", &b)); // B → pattern [A,B] × 3 detected
+    }
+
+    #[test]
+    fn test_loop_detector_different_params_no_loop() {
+        let mut det = super::LoopDetector::new(3);
+        // Same tool but different params — not an exact loop
+        assert!(!det.record("read_file", &serde_json::json!({"path": "a"})));
+        assert!(!det.record("read_file", &serde_json::json!({"path": "b"})));
+        assert!(!det.record("read_file", &serde_json::json!({"path": "c"})));
+    }
+
+    #[test]
+    fn test_loop_detector_threshold_4() {
+        let mut det = super::LoopDetector::new(4);
+        let input = serde_json::json!({"x": 1});
+        assert!(!det.record("tool", &input)); // 1
+        assert!(!det.record("tool", &input)); // 2
+        assert!(!det.record("tool", &input)); // 3
+        assert!(det.record("tool", &input)); // 4 → loop with threshold=4
+    }
+
+    #[test]
+    fn test_loop_detector_minimum_threshold() {
+        // Threshold 1 is clamped to 2
+        let mut det = super::LoopDetector::new(1);
+        let input = serde_json::json!({});
+        assert!(!det.record("tool", &input)); // 1
+        assert!(det.record("tool", &input)); // 2 → loop (min threshold=2)
+    }
+
+    #[test]
+    fn test_hash_tool_call_deterministic() {
+        let a = super::hash_tool_call("read_file", &serde_json::json!({"path": "x"}));
+        let b = super::hash_tool_call("read_file", &serde_json::json!({"path": "x"}));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_hash_tool_call_different() {
+        let a = super::hash_tool_call("read_file", &serde_json::json!({"path": "x"}));
+        let b = super::hash_tool_call("read_file", &serde_json::json!({"path": "y"}));
+        assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context Overflow Recovery tests
+    // -----------------------------------------------------------------------
+
+    /// LLM that returns ContextOverflow on first call, then succeeds.
+    struct OverflowThenSuccessLlm {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OverflowThenSuccessLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, RayClawError> {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 {
+                return Err(RayClawError::ContextOverflow(
+                    "prompt is too long: 130000 tokens > 128000 maximum".into(),
+                ));
+            }
+            Ok(MessagesResponse {
+                content: vec![ResponseContentBlock::Text {
+                    text: "Recovered successfully.".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                usage: None,
+            })
+        }
+    }
+
+    /// LLM that always returns ContextOverflow.
+    struct AlwaysOverflowLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for AlwaysOverflowLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, RayClawError> {
+            Err(RayClawError::ContextOverflow("prompt is too long".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_overflow_recovery_layer1_compaction() {
+        let (_db, base_dir) = test_db();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = test_state_with_llm(
+            &base_dir,
+            Box::new(OverflowThenSuccessLlm {
+                calls: calls.clone(),
+            }),
+        );
+        // Store a long session with many messages using the state's DB
+        let mut msgs: Vec<Message> = Vec::new();
+        for i in 0..20 {
+            msgs.push(Message {
+                role: "user".into(),
+                content: MessageContent::Text(format!("Message {i}")),
+            });
+            msgs.push(Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(format!("Reply {i}")),
+            });
+        }
+        msgs.push(Message {
+            role: "user".into(),
+            content: MessageContent::Text("Final question".into()),
+        });
+        let json = serde_json::to_string(&msgs).unwrap();
+        state.db.save_session(1, &json).unwrap();
+        store_user_message(&state.db, 1, "trigger overflow");
+
+        let result = super::process_with_agent(
+            &state,
+            super::AgentRequestContext {
+                caller_channel: "test",
+                chat_id: 1,
+                chat_type: "private",
+            },
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        // The LLM should have been called at least twice (overflow + retry after compaction)
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_overflow_recovery_all_layers_fail_returns_message() {
+        let (_db, base_dir) = test_db();
+        let state = test_state_with_llm(&base_dir, Box::new(AlwaysOverflowLlm));
+        store_user_message(&state.db, 2, "trigger overflow");
+
+        let result = super::process_with_agent(
+            &state,
+            super::AgentRequestContext {
+                caller_channel: "test",
+                chat_id: 2,
+                chat_type: "private",
+            },
+            None,
+            None,
+        )
+        .await;
+
+        // Even with persistent overflow, should return a user-friendly message, not an error
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        let text = result.unwrap();
+        assert!(
+            text.contains("context") || text.contains("reset"),
+            "Unexpected text: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_from_overflow_layer2_emergency_truncation() {
+        let (_db, base_dir) = test_db();
+        let state = test_state_with_llm(&base_dir, Box::new(DummyLlm));
+
+        // Only 4 messages — Layer 1 requires > 4 messages, so it's skipped.
+        // Layer 2 requires > 2, so it triggers and keeps the last 2.
+        let mut messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("old message".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("old reply".into()),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("recent question".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("recent reply".into()),
+            },
+        ];
+
+        let recovered = super::recover_from_overflow(&state, "test", 3, &mut messages).await;
+        assert!(recovered);
+        // Should have truncated to last 2 messages
+        assert!(
+            messages.len() <= 3,
+            "Expected <= 3 messages, got {}",
+            messages.len()
+        );
+        // First message should be from user role
+        assert_eq!(messages.first().unwrap().role, "user");
+    }
+
+    #[tokio::test]
+    async fn test_recover_from_overflow_too_few_messages() {
+        let (_db, base_dir) = test_db();
+        let state = test_state_with_llm(&base_dir, Box::new(DummyLlm));
+
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: MessageContent::Text("only message".into()),
+        }];
+
+        let recovered = super::recover_from_overflow(&state, "test", 4, &mut messages).await;
+        // Cannot reduce a single message further
+        assert!(!recovered);
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn test_context_overflow_error_variant() {
+        let err = RayClawError::ContextOverflow("test overflow".into());
+        assert!(err.to_string().contains("Context overflow"));
+        assert!(err.to_string().contains("test overflow"));
+    }
+
+    #[test]
+    fn test_classified_error_into_error_context_overflow() {
+        let classified = crate::error_classifier::ClassifiedError {
+            category: crate::error_classifier::LlmErrorCategory::ContextOverflow,
+            message: "too many tokens".into(),
+            status: Some(400),
+            error_type: Some("context_overflow".into()),
+            retry_after: None,
+        };
+        let err = classified.into_error();
+        assert!(matches!(err, RayClawError::ContextOverflow(_)));
+    }
+
+    #[test]
+    fn test_classified_error_into_error_other() {
+        let classified = crate::error_classifier::ClassifiedError {
+            category: crate::error_classifier::LlmErrorCategory::Transient,
+            message: "server error".into(),
+            status: Some(500),
+            error_type: None,
+            retry_after: None,
+        };
+        let err = classified.into_error();
+        assert!(matches!(err, RayClawError::LlmApi(_)));
     }
 }

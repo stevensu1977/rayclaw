@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -25,11 +26,17 @@ fn default_base_url() -> String {
     "https://ilinkai.weixin.qq.com".into()
 }
 
+fn default_cdn_base_url() -> String {
+    "https://novac2c.cdn.weixin.qq.com/c2c".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WeixinChannelConfig {
     pub bot_token: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
+    #[serde(default = "default_cdn_base_url")]
+    pub cdn_base_url: String,
     #[serde(default)]
     pub route_tag: Option<String>,
     #[serde(default)]
@@ -55,6 +62,20 @@ const MSG_STATE_FINISH: u32 = 2;
 
 // Item type constants
 const ITEM_TYPE_TEXT: u32 = 1;
+const ITEM_TYPE_IMAGE: u32 = 2;
+#[allow(dead_code)]
+const ITEM_TYPE_VOICE: u32 = 3;
+const ITEM_TYPE_FILE: u32 = 4;
+const ITEM_TYPE_VIDEO: u32 = 5;
+
+// Upload media type constants (for getuploadurl)
+const UPLOAD_MEDIA_TYPE_IMAGE: u32 = 1;
+const UPLOAD_MEDIA_TYPE_VIDEO: u32 = 2;
+const UPLOAD_MEDIA_TYPE_FILE: u32 = 3;
+
+// CDN upload retry
+const CDN_UPLOAD_MAX_RETRIES: u32 = 3;
+const CDN_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // Typing status
 const TYPING_STATUS_TYPING: u32 = 1;
@@ -91,11 +112,53 @@ struct TextItem {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct CDNMedia {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encrypt_query_param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aes_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encrypt_type: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct ImageItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media: Option<CDNMedia>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mid_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct FileItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media: Option<CDNMedia>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    len: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct VideoItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media: Option<CDNMedia>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct MessageItem {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     item_type: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text_item: Option<TextItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_item: Option<ImageItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_item: Option<FileItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_item: Option<VideoItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     create_time_ms: Option<u64>,
 }
@@ -158,6 +221,15 @@ struct GetConfigResp {
     errmsg: Option<String>,
     #[serde(default)]
     typing_ticket: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
+struct GetUploadUrlResp {
+    #[serde(default)]
+    upload_param: Option<String>,
+    #[serde(default)]
+    thumb_upload_param: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -398,6 +470,240 @@ async fn api_send_typing(
     Ok(())
 }
 
+/// Get a pre-signed CDN upload URL for a file.
+#[allow(clippy::too_many_arguments)]
+async fn api_get_upload_url(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    route_tag: Option<&str>,
+    filekey: &str,
+    media_type: u32,
+    to_user_id: &str,
+    rawsize: u64,
+    rawfilemd5: &str,
+    filesize: u64,
+    aeskey_hex: &str,
+) -> Result<GetUploadUrlResp, String> {
+    let url = format!("{}ilink/bot/getuploadurl", ensure_trailing_slash(base_url));
+    let body = serde_json::json!({
+        "filekey": filekey,
+        "media_type": media_type,
+        "to_user_id": to_user_id,
+        "rawsize": rawsize,
+        "rawfilemd5": rawfilemd5,
+        "filesize": filesize,
+        "no_need_thumb": true,
+        "aeskey": aeskey_hex,
+        "base_info": build_base_info(),
+    });
+
+    let resp = client
+        .post(&url)
+        .headers(build_headers(token, route_tag))
+        .json(&body)
+        .timeout(API_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("getUploadUrl: request failed: {e}"))?;
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("getUploadUrl: failed to read body: {e}"))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("getUploadUrl: failed to parse response: {e}: {text}"))
+}
+
+// ---------------------------------------------------------------------------
+// AES-128-ECB encryption for CDN upload
+// ---------------------------------------------------------------------------
+
+/// Encrypt plaintext with AES-128-ECB and PKCS7 padding.
+fn aes_ecb_encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
+    use aes::Aes128;
+    use ecb::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyInit};
+
+    type Aes128EcbEnc = ecb::Encryptor<Aes128>;
+    let enc = Aes128EcbEnc::new(key.into());
+    enc.encrypt_padded_vec_mut::<Pkcs7>(plaintext)
+}
+
+/// Compute AES-128-ECB ciphertext size with PKCS7 padding.
+fn aes_ecb_padded_size(plaintext_size: u64) -> u64 {
+    (plaintext_size + 1).div_ceil(16) * 16
+}
+
+// ---------------------------------------------------------------------------
+// CDN upload pipeline
+// ---------------------------------------------------------------------------
+
+/// Result of a CDN upload.
+#[allow(dead_code)]
+struct CdnUploadResult {
+    filekey: String,
+    download_encrypted_query_param: String,
+    aeskey_hex: String,
+    file_size: u64,
+    file_size_ciphertext: u64,
+}
+
+/// Upload a file to the Weixin CDN: getUploadUrl → encrypt → POST to CDN.
+#[allow(clippy::too_many_arguments)]
+async fn upload_file_to_cdn(
+    client: &reqwest::Client,
+    base_url: &str,
+    cdn_base_url: &str,
+    token: &str,
+    route_tag: Option<&str>,
+    to_user_id: &str,
+    plaintext: &[u8],
+    media_type: u32,
+) -> Result<CdnUploadResult, String> {
+    use md5::{Digest, Md5};
+
+    let rawsize = plaintext.len() as u64;
+    let rawfilemd5 = format!("{:x}", Md5::new().chain_update(plaintext).finalize());
+    let filesize = aes_ecb_padded_size(rawsize);
+
+    // Generate random filekey (32 hex chars) and AES key (16 bytes)
+    let filekey_uuid = uuid::Uuid::new_v4();
+    let filekey = format!("{:032x}", filekey_uuid.as_u128());
+    let aeskey_bytes: [u8; 16] = {
+        let u = uuid::Uuid::new_v4();
+        let b = u.as_bytes();
+        let mut k = [0u8; 16];
+        k.copy_from_slice(b);
+        k
+    };
+    let aeskey_hex = hex::encode(aeskey_bytes);
+
+    info!(
+        "Weixin CDN: uploading filekey={} rawsize={} filesize={} media_type={}",
+        filekey, rawsize, filesize, media_type
+    );
+
+    // Step 1: Get upload URL
+    let upload_resp = api_get_upload_url(
+        client,
+        base_url,
+        token,
+        route_tag,
+        &filekey,
+        media_type,
+        to_user_id,
+        rawsize,
+        &rawfilemd5,
+        filesize,
+        &aeskey_hex,
+    )
+    .await?;
+
+    let upload_param = upload_resp
+        .upload_param
+        .ok_or("getUploadUrl: no upload_param in response")?;
+
+    // Step 2: Encrypt with AES-128-ECB
+    let ciphertext = aes_ecb_encrypt(plaintext, &aeskey_bytes);
+
+    // Step 3: Upload ciphertext to CDN
+    let cdn_url = format!(
+        "{}/upload?encrypted_query_param={}&filekey={}",
+        cdn_base_url,
+        urlencoding::encode(&upload_param),
+        urlencoding::encode(&filekey),
+    );
+
+    let mut download_param: Option<String> = None;
+    let mut last_error: Option<String> = None;
+
+    for attempt in 1..=CDN_UPLOAD_MAX_RETRIES {
+        let result = client
+            .post(&cdn_url)
+            .header("Content-Type", "application/octet-stream")
+            .body(ciphertext.clone())
+            .timeout(CDN_UPLOAD_TIMEOUT)
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.as_u16() >= 400 && status.as_u16() < 500 {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(format!("CDN upload client error (HTTP {status}): {body}"));
+                }
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    last_error = Some(format!("CDN upload server error (HTTP {status}): {body}"));
+                    warn!(
+                        "Weixin CDN: attempt {attempt}/{CDN_UPLOAD_MAX_RETRIES} failed: {}",
+                        last_error.as_deref().unwrap_or("unknown")
+                    );
+                    continue;
+                }
+                // Extract download param from response header
+                if let Some(val) = resp.headers().get("x-encrypted-param") {
+                    download_param = val.to_str().ok().map(|s| s.to_string());
+                }
+                if download_param.is_none() {
+                    last_error = Some("CDN upload: missing x-encrypted-param header".into());
+                    warn!(
+                        "Weixin CDN: attempt {attempt}/{CDN_UPLOAD_MAX_RETRIES}: {}",
+                        last_error.as_deref().unwrap_or("unknown")
+                    );
+                    continue;
+                }
+                break;
+            }
+            Err(e) => {
+                last_error = Some(format!("CDN upload request failed: {e}"));
+                warn!(
+                    "Weixin CDN: attempt {attempt}/{CDN_UPLOAD_MAX_RETRIES}: {}",
+                    last_error.as_deref().unwrap_or("unknown")
+                );
+            }
+        }
+    }
+
+    let download_encrypted_query_param =
+        download_param.ok_or_else(|| last_error.unwrap_or_else(|| "CDN upload failed".into()))?;
+
+    info!("Weixin CDN: upload success filekey={}", filekey);
+
+    Ok(CdnUploadResult {
+        filekey,
+        download_encrypted_query_param,
+        aeskey_hex,
+        file_size: rawsize,
+        file_size_ciphertext: filesize,
+    })
+}
+
+/// Build a CDNMedia reference from upload result.
+fn build_cdn_media(upload: &CdnUploadResult) -> CDNMedia {
+    use base64::Engine;
+    CDNMedia {
+        encrypt_query_param: Some(upload.download_encrypted_query_param.clone()),
+        aes_key: Some(
+            base64::engine::general_purpose::STANDARD.encode(upload.aeskey_hex.as_bytes()),
+        ),
+        encrypt_type: Some(1),
+    }
+}
+
+/// Determine the upload media type from a file extension.
+fn media_type_for_extension(ext: &str) -> (u32, u32) {
+    // Returns (upload_media_type, item_type)
+    match ext {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" => {
+            (UPLOAD_MEDIA_TYPE_IMAGE, ITEM_TYPE_IMAGE)
+        }
+        "mp4" | "mov" | "avi" | "mkv" | "webm" => (UPLOAD_MEDIA_TYPE_VIDEO, ITEM_TYPE_VIDEO),
+        _ => (UPLOAD_MEDIA_TYPE_FILE, ITEM_TYPE_FILE),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Text splitting
 // ---------------------------------------------------------------------------
@@ -457,6 +763,7 @@ fn split_text_chunks(text: &str, max_chars: usize) -> Vec<&str> {
 pub struct WeixinAdapter {
     http_client: reqwest::Client,
     base_url: String,
+    cdn_base_url: String,
     bot_token: String,
     route_tag: Option<String>,
     /// from_user_id -> context_token (must echo in every outbound send)
@@ -470,6 +777,7 @@ impl WeixinAdapter {
         WeixinAdapter {
             http_client: reqwest::Client::new(),
             base_url: config.base_url.clone(),
+            cdn_base_url: config.cdn_base_url.clone(),
             bot_token: config.bot_token.clone(),
             route_tag: config.route_tag.clone(),
             context_tokens: Arc::new(RwLock::new(HashMap::new())),
@@ -559,6 +867,142 @@ impl ChannelAdapter for WeixinAdapter {
         let context_token = self.get_context_token(external_chat_id).await;
         self.send_text_to_user(external_chat_id, text, context_token.as_deref())
             .await
+    }
+
+    async fn send_attachment(
+        &self,
+        external_chat_id: &str,
+        file_path: &Path,
+        caption: Option<&str>,
+    ) -> Result<String, String> {
+        let context_token = self.get_context_token(external_chat_id).await;
+
+        // Read file
+        let plaintext = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| format!("Failed to read attachment: {e}"))?;
+
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+
+        let ext = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let (upload_media_type, item_type) = media_type_for_extension(&ext);
+
+        info!(
+            "Weixin: sending attachment {} ({} bytes) type={} to {}",
+            filename,
+            plaintext.len(),
+            item_type,
+            external_chat_id
+        );
+
+        // Upload to CDN
+        let upload = upload_file_to_cdn(
+            &self.http_client,
+            &self.base_url,
+            &self.cdn_base_url,
+            &self.bot_token,
+            self.route_tag.as_deref(),
+            external_chat_id,
+            &plaintext,
+            upload_media_type,
+        )
+        .await?;
+
+        // Send caption as separate text message first (if provided)
+        if let Some(cap) = caption {
+            if !cap.is_empty() {
+                let text_msg = WeixinMessage {
+                    from_user_id: Some(String::new()),
+                    to_user_id: Some(external_chat_id.to_string()),
+                    client_id: Some(uuid::Uuid::new_v4().to_string()),
+                    message_type: Some(MSG_TYPE_BOT),
+                    message_state: Some(MSG_STATE_FINISH),
+                    item_list: Some(vec![MessageItem {
+                        item_type: Some(ITEM_TYPE_TEXT),
+                        text_item: Some(TextItem {
+                            text: Some(cap.to_string()),
+                        }),
+                        ..Default::default()
+                    }]),
+                    context_token: context_token.clone(),
+                    ..Default::default()
+                };
+                api_send_message(
+                    &self.http_client,
+                    &self.base_url,
+                    &self.bot_token,
+                    self.route_tag.as_deref(),
+                    text_msg,
+                )
+                .await?;
+            }
+        }
+
+        // Build media message item based on type
+        let media_item = match item_type {
+            ITEM_TYPE_IMAGE => MessageItem {
+                item_type: Some(ITEM_TYPE_IMAGE),
+                image_item: Some(ImageItem {
+                    media: Some(build_cdn_media(&upload)),
+                    mid_size: Some(upload.file_size_ciphertext),
+                }),
+                ..Default::default()
+            },
+            ITEM_TYPE_VIDEO => MessageItem {
+                item_type: Some(ITEM_TYPE_VIDEO),
+                video_item: Some(VideoItem {
+                    media: Some(build_cdn_media(&upload)),
+                    video_size: Some(upload.file_size_ciphertext),
+                }),
+                ..Default::default()
+            },
+            _ => MessageItem {
+                item_type: Some(ITEM_TYPE_FILE),
+                file_item: Some(FileItem {
+                    media: Some(build_cdn_media(&upload)),
+                    file_name: Some(filename.clone()),
+                    len: Some(upload.file_size.to_string()),
+                }),
+                ..Default::default()
+            },
+        };
+
+        // Send the media message
+        let media_msg = WeixinMessage {
+            from_user_id: Some(String::new()),
+            to_user_id: Some(external_chat_id.to_string()),
+            client_id: Some(uuid::Uuid::new_v4().to_string()),
+            message_type: Some(MSG_TYPE_BOT),
+            message_state: Some(MSG_STATE_FINISH),
+            item_list: Some(vec![media_item]),
+            context_token: context_token.clone(),
+            ..Default::default()
+        };
+
+        api_send_message(
+            &self.http_client,
+            &self.base_url,
+            &self.bot_token,
+            self.route_tag.as_deref(),
+            media_msg,
+        )
+        .await?;
+
+        let content = match caption {
+            Some(c) if !c.is_empty() => format!("[attachment:{}] {}", file_path.display(), c),
+            _ => format!("[attachment:{}]", file_path.display()),
+        };
+
+        Ok(content)
     }
 }
 
@@ -1326,4 +1770,181 @@ pub async fn run_qr_login(
     }
 
     Err("Login timed out. Please try again.".into())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- aes_ecb_padded_size --------------------------------------------------
+
+    #[test]
+    fn test_aes_ecb_padded_size_zero() {
+        // 0 bytes plaintext → 1 byte padding minimum → ceil((0+1)/16)*16 = 16
+        assert_eq!(aes_ecb_padded_size(0), 16);
+    }
+
+    #[test]
+    fn test_aes_ecb_padded_size_15() {
+        // 15 bytes → ceil((15+1)/16)*16 = 16
+        assert_eq!(aes_ecb_padded_size(15), 16);
+    }
+
+    #[test]
+    fn test_aes_ecb_padded_size_16() {
+        // 16 bytes → ceil((16+1)/16)*16 = 32  (needs extra block for padding)
+        assert_eq!(aes_ecb_padded_size(16), 32);
+    }
+
+    #[test]
+    fn test_aes_ecb_padded_size_31() {
+        // 31 bytes → ceil((31+1)/16)*16 = 32
+        assert_eq!(aes_ecb_padded_size(31), 32);
+    }
+
+    #[test]
+    fn test_aes_ecb_padded_size_100() {
+        // 100 bytes → ceil((100+1)/16)*16 = ceil(101/16)*16 = 7*16 = 112
+        assert_eq!(aes_ecb_padded_size(100), 112);
+    }
+
+    // -- aes_ecb_encrypt / decrypt round-trip ---------------------------------
+
+    #[test]
+    fn test_aes_ecb_encrypt_basic() {
+        let key: [u8; 16] = [0x42; 16];
+        let plaintext = b"hello world!";
+        let ciphertext = aes_ecb_encrypt(plaintext, &key);
+
+        // Ciphertext length must match padded size
+        assert_eq!(
+            ciphertext.len() as u64,
+            aes_ecb_padded_size(plaintext.len() as u64)
+        );
+        // Must not be all zeros
+        assert!(ciphertext.iter().any(|&b| b != 0));
+        // Must differ from plaintext
+        assert_ne!(&ciphertext[..plaintext.len()], plaintext);
+    }
+
+    #[test]
+    fn test_aes_ecb_encrypt_deterministic() {
+        let key: [u8; 16] = [0xAB; 16];
+        let plaintext = b"same input same output";
+        let ct1 = aes_ecb_encrypt(plaintext, &key);
+        let ct2 = aes_ecb_encrypt(plaintext, &key);
+        assert_eq!(ct1, ct2);
+    }
+
+    #[test]
+    fn test_aes_ecb_encrypt_different_keys() {
+        let key1: [u8; 16] = [0x01; 16];
+        let key2: [u8; 16] = [0x02; 16];
+        let plaintext = b"test data for encryption";
+        let ct1 = aes_ecb_encrypt(plaintext, &key1);
+        let ct2 = aes_ecb_encrypt(plaintext, &key2);
+        assert_ne!(ct1, ct2);
+    }
+
+    #[test]
+    fn test_aes_ecb_encrypt_empty() {
+        let key: [u8; 16] = [0xFF; 16];
+        let ciphertext = aes_ecb_encrypt(b"", &key);
+        // Empty plaintext → 16 bytes ciphertext (one block of padding)
+        assert_eq!(ciphertext.len(), 16);
+    }
+
+    #[test]
+    fn test_aes_ecb_encrypt_large_file() {
+        let key: [u8; 16] = [0x55; 16];
+        let plaintext = vec![0xAA; 4096]; // 4KB
+        let ciphertext = aes_ecb_encrypt(&plaintext, &key);
+        assert_eq!(ciphertext.len() as u64, aes_ecb_padded_size(4096));
+    }
+
+    // -- media_type_for_extension ---------------------------------------------
+
+    #[test]
+    fn test_media_type_image_extensions() {
+        for ext in ["png", "jpg", "jpeg", "gif", "bmp", "webp"] {
+            let (upload, item) = media_type_for_extension(ext);
+            assert_eq!(upload, UPLOAD_MEDIA_TYPE_IMAGE, "ext={ext}");
+            assert_eq!(item, ITEM_TYPE_IMAGE, "ext={ext}");
+        }
+    }
+
+    #[test]
+    fn test_media_type_video_extensions() {
+        for ext in ["mp4", "mov", "avi", "mkv", "webm"] {
+            let (upload, item) = media_type_for_extension(ext);
+            assert_eq!(upload, UPLOAD_MEDIA_TYPE_VIDEO, "ext={ext}");
+            assert_eq!(item, ITEM_TYPE_VIDEO, "ext={ext}");
+        }
+    }
+
+    #[test]
+    fn test_media_type_file_extensions() {
+        for ext in [
+            "pdf", "md", "doc", "docx", "zip", "txt", "xls", "ppt", "csv", "",
+        ] {
+            let (upload, item) = media_type_for_extension(ext);
+            assert_eq!(upload, UPLOAD_MEDIA_TYPE_FILE, "ext={ext}");
+            assert_eq!(item, ITEM_TYPE_FILE, "ext={ext}");
+        }
+    }
+
+    // -- build_cdn_media ------------------------------------------------------
+
+    #[test]
+    fn test_build_cdn_media() {
+        let upload = CdnUploadResult {
+            filekey: "abc123".into(),
+            download_encrypted_query_param: "some_param".into(),
+            aeskey_hex: "00112233445566778899aabbccddeeff".into(),
+            file_size: 1024,
+            file_size_ciphertext: 1040,
+        };
+        let media = build_cdn_media(&upload);
+        assert_eq!(media.encrypt_query_param.as_deref(), Some("some_param"));
+        assert_eq!(media.encrypt_type, Some(1));
+        // aes_key should be base64 of the hex string bytes
+        assert!(media.aes_key.is_some());
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            media.aes_key.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "00112233445566778899aabbccddeeff"
+        );
+    }
+
+    // -- split_text_chunks ----------------------------------------------------
+
+    #[test]
+    fn test_split_text_short() {
+        let chunks = split_text_chunks("hello", 4000);
+        assert_eq!(chunks, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_split_text_exact_boundary() {
+        let text = "a".repeat(4000);
+        let chunks = split_text_chunks(&text, 4000);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_split_text_over_boundary() {
+        let text = "a".repeat(4001);
+        let chunks = split_text_chunks(&text, 4000);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 4000);
+        assert_eq!(chunks[1].len(), 1);
+    }
 }

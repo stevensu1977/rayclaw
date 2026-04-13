@@ -716,6 +716,7 @@ pub struct BedrockProvider {
     model: String,
     max_tokens: u32,
     prompt_cache_ttl: String,
+    idle_timeout: std::time::Duration,
 }
 
 impl BedrockProvider {
@@ -727,6 +728,7 @@ impl BedrockProvider {
             model: config.model.clone(),
             max_tokens: config.max_tokens,
             prompt_cache_ttl: config.prompt_cache_ttl.clone(),
+            idle_timeout: std::time::Duration::from_secs(config.llm_idle_timeout_secs.max(5)),
         })
     }
 
@@ -859,13 +861,14 @@ impl LlmProvider for BedrockProvider {
                         classified.category,
                         retries,
                         max_retries,
+                        None,
                     ) {
                         retries += 1;
                         warn!("Bedrock network error, retrying in {delay:?} (attempt {retries}/{max_retries}): {e}");
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(RayClawError::LlmApi(classified.to_string()));
+                    return Err(classified.into_error());
                 }
             };
             let status = response.status();
@@ -876,12 +879,21 @@ impl LlmProvider for BedrockProvider {
             }
 
             let status_code = status.as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::error_classifier::parse_retry_after);
             let err_body = response.text().await.unwrap_or_default();
-            let classified = crate::error_classifier::classify_http(status_code, &err_body);
+            let mut classified = crate::error_classifier::classify_http(status_code, &err_body);
+            classified.retry_after = retry_after;
 
-            if let Some(delay) =
-                crate::error_classifier::retry_delay(classified.category, retries, max_retries)
-            {
+            if let Some(delay) = crate::error_classifier::retry_delay(
+                classified.category,
+                retries,
+                max_retries,
+                classified.retry_after,
+            ) {
                 retries += 1;
                 warn!(
                     "Bedrock {}, retrying in {delay:?} (attempt {retries}/{max_retries})",
@@ -891,7 +903,7 @@ impl LlmProvider for BedrockProvider {
                 continue;
             }
 
-            return Err(RayClawError::LlmApi(classified.to_string()));
+            return Err(classified.into_error());
         }
     }
 
@@ -958,7 +970,19 @@ impl LlmProvider for BedrockProvider {
         let mut stop_reason: Option<String> = None;
         let mut usage: Option<Usage> = None;
 
-        while let Some(chunk_result) = stream.next().await {
+        let idle_timeout = self.idle_timeout;
+        loop {
+            let chunk_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
+                Ok(Some(res)) => res,
+                Ok(None) => break,
+                Err(_) => {
+                    warn!("Bedrock streaming idle timeout after {:?}", idle_timeout);
+                    return Err(RayClawError::LlmApi(format!(
+                        "Streaming idle timeout: no data received for {:?}",
+                        idle_timeout
+                    )));
+                }
+            };
             let chunk = chunk_result?;
             parser.feed(&chunk);
 
@@ -1323,6 +1347,8 @@ mod tests {
             max_tokens: 8192,
             prompt_cache_ttl: "none".into(),
             max_tool_iterations: 50,
+            max_loop_repeats: 3,
+            llm_idle_timeout_secs: 30,
             max_history_messages: 50,
             llm_base_url: None,
             openai_api_key: None,
@@ -1394,6 +1420,7 @@ mod tests {
             model: "anthropic.claude-sonnet-4-5-v2".into(),
             max_tokens: 4096,
             prompt_cache_ttl: cache_ttl.into(),
+            idle_timeout: std::time::Duration::from_secs(30),
         }
     }
 

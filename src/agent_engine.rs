@@ -6,6 +6,7 @@ use crate::db::{call_blocking, Database, StoredMessage};
 use crate::embedding::EmbeddingProvider;
 use crate::llm_types::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
 use crate::memory_quality;
+use crate::metrics::{self, SessionMetrics};
 use crate::runtime::AppState;
 use crate::text::floor_char_boundary;
 use crate::tools::ToolAuthContext;
@@ -617,6 +618,31 @@ fn spawn_acp_progress_consumer(
     })
 }
 
+/// Finalize and persist session metrics to the database. Fire-and-forget: errors are logged, not propagated.
+async fn flush_session_metrics(
+    db: std::sync::Arc<Database>,
+    metrics: &mut SessionMetrics,
+    session_start: std::time::Instant,
+    iterations: u32,
+) {
+    metrics.session_duration_ms = session_start.elapsed().as_millis() as u64;
+    metrics.total_iterations = iterations;
+    metrics.timestamp = chrono::Utc::now().to_rfc3339();
+    let chat_id = metrics.chat_id;
+    // Clone first so tool_call_count is preserved, then take the Vec for batch insert
+    let m = metrics.clone();
+    let tool_calls = std::mem::take(&mut metrics.tool_calls);
+    if let Err(e) = call_blocking(db, move |db| {
+        db.insert_session_metrics(&m)?;
+        db.insert_tool_call_logs_batch(chat_id, &tool_calls)?;
+        Ok(())
+    })
+    .await
+    {
+        warn!("Failed to flush session metrics: {e}");
+    }
+}
+
 pub(crate) async fn process_with_agent_impl(
     state: &AppState,
     context: AgentRequestContext<'_>,
@@ -649,6 +675,10 @@ pub(crate) async fn process_with_agent_impl(
     if let Some(reply) = maybe_handle_acp(state, chat_id, override_prompt, &image_data).await? {
         return Ok(reply);
     }
+
+    // Phase 0: Initialize session metrics (after early returns so we only track agent loop runs)
+    let session_start = std::time::Instant::now();
+    let mut session_metrics = SessionMetrics::new(chat_id, context.caller_channel);
 
     // Load messages first so we can use the latest user message as the relevance query
     let mut messages = if let Some((json, updated_at)) =
@@ -752,6 +782,14 @@ pub(crate) async fn process_with_agent_impl(
         .chars()
         .take(500)
         .collect();
+
+    // Phase 0: Detect user feedback signals
+    for signal in metrics::detect_feedback_signals(&query) {
+        match signal {
+            metrics::FeedbackSignal::Correction => session_metrics.user_corrections += 1,
+            metrics::FeedbackSignal::Positive => session_metrics.user_positive_signals += 1,
+        }
+    }
 
     // Build system prompt
     let file_memory = state.memory.build_memory_context(chat_id);
@@ -903,6 +941,7 @@ pub(crate) async fn process_with_agent_impl(
                 if !overflow_recovery_attempted =>
             {
                 overflow_recovery_attempted = true;
+                session_metrics.record_error("context_overflow");
                 warn!(
                     "Context overflow detected (chat_id={}): {}. Attempting recovery.",
                     chat_id, msg
@@ -911,6 +950,7 @@ pub(crate) async fn process_with_agent_impl(
                     recover_from_overflow(state, context.caller_channel, chat_id, &mut messages)
                         .await;
                 if recovered {
+                    session_metrics.overflow_recovered = true;
                     continue; // retry with compacted messages
                 }
                 // Recovery failed — return a user-friendly message
@@ -920,12 +960,21 @@ pub(crate) async fn process_with_agent_impl(
                         text: overflow_msg.clone(),
                     });
                 }
+                session_metrics.overflow_recovered = false;
+                flush_session_metrics(
+                    state.db.clone(),
+                    &mut session_metrics,
+                    session_start,
+                    iteration as u32 + 1,
+                )
+                .await;
                 return Ok(overflow_msg);
             }
             Err(e) => return Err(e.into()),
         };
 
         if let Some(usage) = &response.usage {
+            session_metrics.record_llm_usage(usage.input_tokens, usage.output_tokens);
             let channel = context.caller_channel.to_string();
             let provider = state.config.llm_provider.clone();
             let model = state.config.model.clone();
@@ -1044,6 +1093,13 @@ pub(crate) async fn process_with_agent_impl(
                     text: final_text.clone(),
                 });
             }
+            flush_session_metrics(
+                state.db.clone(),
+                &mut session_metrics,
+                session_start,
+                iteration as u32 + 1,
+            )
+            .await;
             return Ok(final_text);
         }
 
@@ -1121,6 +1177,33 @@ pub(crate) async fn process_with_agent_impl(
                             error_type: result.error_type.clone(),
                         });
                     }
+                    // Phase 0: Record tool call metric
+                    let tool_dur = result
+                        .duration_ms
+                        .unwrap_or_else(|| started.elapsed().as_millis())
+                        as u64;
+                    session_metrics.record_tool_call(name, !result.is_error, tool_dur);
+                    if result.is_error {
+                        session_metrics
+                            .record_error(result.error_type.as_deref().unwrap_or("tool_error"));
+                    }
+
+                    // Phase 1: Record skill activation
+                    if name == "activate_skill" {
+                        if let Some(skill_name) = input.get("skill_name").and_then(|v| v.as_str()) {
+                            let sn = skill_name.to_string();
+                            let success = !result.is_error;
+                            let tokens_est = (result.content.len() / 4) as u64;
+                            let skill_ts = chrono::Utc::now().to_rfc3339();
+                            let _ = call_blocking(state.db.clone(), move |db| {
+                                db.insert_skill_activation(
+                                    chat_id, &sn, success, tokens_est, tool_dur, &skill_ts,
+                                )
+                            })
+                            .await;
+                        }
+                    }
+
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: result.content,
@@ -1140,6 +1223,7 @@ pub(crate) async fn process_with_agent_impl(
             }
 
             if loop_detected {
+                session_metrics.loop_detected = true;
                 warn!(
                     "Loop detected after {} iterations (chat_id={}). Forcing stop.",
                     iteration + 1,
@@ -1167,6 +1251,13 @@ pub(crate) async fn process_with_agent_impl(
                         text: loop_msg.clone(),
                     });
                 }
+                flush_session_metrics(
+                    state.db.clone(),
+                    &mut session_metrics,
+                    session_start,
+                    iteration as u32 + 1,
+                )
+                .await;
                 return Ok(loop_msg);
             }
 
@@ -1200,6 +1291,13 @@ pub(crate) async fn process_with_agent_impl(
                 call_blocking(state.db.clone(), move |db| db.save_session(chat_id, &json)).await;
         }
 
+        flush_session_metrics(
+            state.db.clone(),
+            &mut session_metrics,
+            session_start,
+            iteration as u32 + 1,
+        )
+        .await;
         return Ok(if text.is_empty() {
             "(no response)".into()
         } else {
@@ -1228,6 +1326,13 @@ pub(crate) async fn process_with_agent_impl(
             text: max_iter_msg.clone(),
         });
     }
+    flush_session_metrics(
+        state.db.clone(),
+        &mut session_metrics,
+        session_start,
+        state.config.max_tool_iterations as u32,
+    )
+    .await;
     Ok(max_iter_msg)
 }
 

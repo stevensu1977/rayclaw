@@ -1,5 +1,39 @@
 use serde::Deserialize;
+use std::fmt;
 use std::path::PathBuf;
+
+/// Trust level for skills — determines discovery, catalog display, and tool permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum TrustLevel {
+    Archived,  // not loaded
+    Candidate, // auto-generated, unverified — read-only tools only
+    Verified,  // auto-generated, confirmed effective
+    #[default]
+    Official, // hand-written, shipped with the code
+}
+
+impl fmt::Display for TrustLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrustLevel::Archived => write!(f, "archived"),
+            TrustLevel::Candidate => write!(f, "candidate"),
+            TrustLevel::Verified => write!(f, "verified"),
+            TrustLevel::Official => write!(f, "official"),
+        }
+    }
+}
+
+impl TrustLevel {
+    pub fn from_str_opt(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "archived" => TrustLevel::Archived,
+            "candidate" => TrustLevel::Candidate,
+            "verified" => TrustLevel::Verified,
+            "official" => TrustLevel::Official,
+            _ => TrustLevel::Official,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SkillMetadata {
@@ -11,6 +45,7 @@ pub struct SkillMetadata {
     pub source: String,
     pub version: Option<String>,
     pub updated_at: Option<String>,
+    pub trust_level: TrustLevel,
 }
 
 /// A skill with its availability status on the current platform.
@@ -39,6 +74,8 @@ struct SkillFrontmatter {
     version: Option<String>,
     #[serde(default)]
     updated_at: Option<String>,
+    #[serde(default)]
+    trust_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -87,26 +124,49 @@ impl SkillManager {
             .collect()
     }
 
+    /// Return directories to scan for skills: the main skills_dir + auto-generated/.
+    fn discovery_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.skills_dir.clone()];
+        let auto_gen = self.skills_dir.join("auto-generated");
+        if auto_gen.is_dir() {
+            dirs.push(auto_gen);
+        }
+        dirs
+    }
+
     fn discover_skills_internal(&self, include_unavailable: bool) -> Vec<SkillMetadata> {
         let mut skills = Vec::new();
-        let entries = match std::fs::read_dir(&self.skills_dir) {
-            Ok(e) => e,
-            Err(_) => return skills,
-        };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let skill_md = path.join("SKILL.md");
-            if !skill_md.exists() {
-                continue;
-            }
-            if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                if let Some((meta, _body)) = parse_skill_md(&content, &path) {
-                    if include_unavailable || self.skill_is_available(&meta).is_ok() {
-                        skills.push(meta);
+        for scan_dir in self.discovery_dirs() {
+            let entries = match std::fs::read_dir(&scan_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // Skip hidden directories and .archive/
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') || name == "auto-generated" {
+                        continue;
+                    }
+                }
+                let skill_md = path.join("SKILL.md");
+                if !skill_md.exists() {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                    if let Some((meta, _body)) = parse_skill_md(&content, &path) {
+                        // Skip archived skills
+                        if meta.trust_level == TrustLevel::Archived {
+                            continue;
+                        }
+                        if include_unavailable || self.skill_is_available(&meta).is_ok() {
+                            skills.push(meta);
+                        }
                     }
                 }
             }
@@ -186,7 +246,14 @@ impl SkillManager {
         }
         let mut catalog = String::from("<available_skills>\n");
         for skill in &skills {
-            catalog.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            if skill.trust_level == TrustLevel::Official {
+                catalog.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            } else {
+                catalog.push_str(&format!(
+                    "- {} [{}]: {}\n",
+                    skill.name, skill.trust_level, skill.description
+                ));
+            }
         }
         catalog.push_str("</available_skills>");
         catalog
@@ -350,6 +417,7 @@ fn normalize_single_line_frontmatter(content: &str) -> Option<String> {
         "source:",
         "version:",
         "updated_at:",
+        "trust_level:",
     ];
     let mut yaml = yaml_part.to_string();
     for key in known_keys {
@@ -432,6 +500,12 @@ fn parse_skill_md(content: &str, dir_path: &std::path::Path) -> Option<(SkillMet
         .trim()
         .to_string();
 
+    let trust_level = fm
+        .trust_level
+        .as_deref()
+        .map(TrustLevel::from_str_opt)
+        .unwrap_or(TrustLevel::Official);
+
     Some((
         SkillMetadata {
             name,
@@ -452,6 +526,7 @@ fn parse_skill_md(content: &str, dir_path: &std::path::Path) -> Option<(SkillMet
                 .updated_at
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            trust_level,
         },
         body,
     ))
@@ -480,6 +555,7 @@ Use this skill to convert documents.
         assert_eq!(meta.platforms, vec!["darwin", "linux"]);
         assert_eq!(meta.deps, vec!["pandoc"]);
         assert_eq!(meta.source, "local");
+        assert_eq!(meta.trust_level, TrustLevel::Official); // default
         assert!(body.contains("Use this skill"));
     }
 
@@ -536,6 +612,31 @@ Instructions.
     #[test]
     fn test_platform_allowed_empty_means_all() {
         assert!(platform_allowed(&[]));
+    }
+
+    #[test]
+    fn test_parse_skill_md_trust_level_candidate() {
+        let content = r#"---
+name: auto-search
+description: Auto search skill
+trust_level: candidate
+source: auto-generated
+---
+Search instructions.
+"#;
+        let dir = PathBuf::from("/tmp/skills/auto-search");
+        let (meta, _) = parse_skill_md(content, &dir).unwrap();
+        assert_eq!(meta.trust_level, TrustLevel::Candidate);
+        assert_eq!(meta.source, "auto-generated");
+    }
+
+    #[test]
+    fn test_trust_level_from_str() {
+        assert_eq!(TrustLevel::from_str_opt("candidate"), TrustLevel::Candidate);
+        assert_eq!(TrustLevel::from_str_opt("verified"), TrustLevel::Verified);
+        assert_eq!(TrustLevel::from_str_opt("official"), TrustLevel::Official);
+        assert_eq!(TrustLevel::from_str_opt("archived"), TrustLevel::Archived);
+        assert_eq!(TrustLevel::from_str_opt("unknown"), TrustLevel::Official);
     }
 
     #[test]

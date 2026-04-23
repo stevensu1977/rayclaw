@@ -140,7 +140,55 @@ pub struct MemoryInjectionLog {
     pub tokens_est: i64,
 }
 
-const SCHEMA_VERSION_CURRENT: i64 = 4;
+const SCHEMA_VERSION_CURRENT: i64 = 6;
+
+// Phase 0 observability row types
+
+#[derive(Debug, Clone)]
+pub struct SessionMetricsRow {
+    pub id: i64,
+    pub chat_id: i64,
+    pub channel: String,
+    pub timestamp: String,
+    pub total_iterations: u32,
+    pub tool_call_count: u32,
+    pub llm_input_tokens: u64,
+    pub llm_output_tokens: u64,
+    pub error_count: u32,
+    pub error_categories: Vec<String>,
+    pub loop_detected: bool,
+    pub overflow_recovered: bool,
+    pub user_corrections: u32,
+    pub user_positive_signals: u32,
+    pub session_duration_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallStats {
+    pub tool_name: String,
+    pub call_count: u64,
+    pub success_count: u64,
+    pub avg_duration_ms: f64,
+}
+
+// Phase 1: Skill evolution row types
+
+#[derive(Debug, Clone)]
+pub struct SkillHealthRow {
+    pub skill_name: String,
+    pub total_activations: u64,
+    pub successful_activations: u64,
+    pub avg_tokens: f64,
+    pub avg_duration_ms: f64,
+    pub last_activated_at: String,
+    pub first_activated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallSequence {
+    pub chat_id: i64,
+    pub tool_names: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -402,6 +450,72 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), RayClawError> {
         )?;
         set_schema_version(conn, 4)?;
         version = 4;
+    }
+    if version < 5 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                total_iterations INTEGER NOT NULL DEFAULT 0,
+                tool_call_count INTEGER NOT NULL DEFAULT 0,
+                llm_input_tokens INTEGER NOT NULL DEFAULT 0,
+                llm_output_tokens INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                error_categories TEXT NOT NULL DEFAULT '[]',
+                loop_detected INTEGER NOT NULL DEFAULT 0,
+                overflow_recovered INTEGER NOT NULL DEFAULT 0,
+                user_corrections INTEGER NOT NULL DEFAULT 0,
+                user_positive_signals INTEGER NOT NULL DEFAULT 0,
+                session_duration_ms INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_metrics_chat_ts
+                ON session_metrics(chat_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_session_metrics_ts
+                ON session_metrics(timestamp);
+            CREATE TABLE IF NOT EXISTS tool_call_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                success INTEGER NOT NULL DEFAULT 1,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_call_logs_chat_ts
+                ON tool_call_logs(chat_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_tool_call_logs_tool_ts
+                ON tool_call_logs(tool_name, timestamp);",
+        )?;
+        set_schema_version(conn, 5)?;
+        version = 5;
+    }
+    if version < 6 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_activations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                skill_name TEXT NOT NULL,
+                success INTEGER NOT NULL DEFAULT 1,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_skill_activations_name_ts
+                ON skill_activations(skill_name, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_skill_activations_ts
+                ON skill_activations(timestamp);
+            CREATE TABLE IF NOT EXISTS skill_generation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern_hash TEXT NOT NULL UNIQUE,
+                skill_name TEXT,
+                generated_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'generated'
+            );
+            ALTER TABLE tool_call_logs ADD COLUMN session_metric_id INTEGER;",
+        )?;
+        set_schema_version(conn, 6)?;
+        version = 6;
     }
     if version != SCHEMA_VERSION_CURRENT {
         set_schema_version(conn, SCHEMA_VERSION_CURRENT)?;
@@ -2590,6 +2704,293 @@ impl Database {
             (None, None) => stmt.query_map([], mapper)?,
         };
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 0: Session metrics & tool call logs
+    // ------------------------------------------------------------------
+
+    pub fn insert_session_metrics(
+        &self,
+        m: &crate::metrics::SessionMetrics,
+    ) -> Result<i64, RayClawError> {
+        let conn = self.lock_conn();
+        let categories_json = serde_json::to_string(&m.error_categories).unwrap_or_default();
+        conn.execute(
+            "INSERT INTO session_metrics (
+                chat_id, channel, timestamp, total_iterations, tool_call_count,
+                llm_input_tokens, llm_output_tokens, error_count, error_categories,
+                loop_detected, overflow_recovered, user_corrections, user_positive_signals,
+                session_duration_ms
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                m.chat_id,
+                m.channel,
+                m.timestamp,
+                m.total_iterations,
+                m.tool_calls.len() as u32,
+                m.llm_input_tokens as i64,
+                m.llm_output_tokens as i64,
+                m.error_count,
+                categories_json,
+                m.loop_detected as i32,
+                m.overflow_recovered as i32,
+                m.user_corrections,
+                m.user_positive_signals,
+                m.session_duration_ms as i64,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn insert_tool_call_logs_batch(
+        &self,
+        chat_id: i64,
+        calls: &[crate::metrics::ToolCallMetric],
+    ) -> Result<(), RayClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "INSERT INTO tool_call_logs (chat_id, tool_name, success, duration_ms, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for c in calls {
+            stmt.execute(params![
+                chat_id,
+                c.tool_name,
+                c.success as i32,
+                c.duration_ms as i64,
+                c.timestamp,
+            ])?;
+        }
+        Ok(())
+    }
+
+    pub fn get_session_metrics_since(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMetricsRow>, RayClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, channel, timestamp, total_iterations, tool_call_count,
+                    llm_input_tokens, llm_output_tokens, error_count, error_categories,
+                    loop_detected, overflow_recovered, user_corrections, user_positive_signals,
+                    session_duration_ms
+             FROM session_metrics
+             WHERE timestamp > ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since, limit as i64], |row| {
+            let cats_json: String = row.get(9)?;
+            let error_categories: Vec<String> =
+                serde_json::from_str(&cats_json).unwrap_or_default();
+            Ok(SessionMetricsRow {
+                id: row.get(0)?,
+                chat_id: row.get(1)?,
+                channel: row.get(2)?,
+                timestamp: row.get(3)?,
+                total_iterations: row.get::<_, u32>(4)?,
+                tool_call_count: row.get::<_, u32>(5)?,
+                llm_input_tokens: row.get::<_, i64>(6)? as u64,
+                llm_output_tokens: row.get::<_, i64>(7)? as u64,
+                error_count: row.get::<_, u32>(8)?,
+                error_categories,
+                loop_detected: row.get::<_, i32>(10)? != 0,
+                overflow_recovered: row.get::<_, i32>(11)? != 0,
+                user_corrections: row.get::<_, u32>(12)?,
+                user_positive_signals: row.get::<_, u32>(13)?,
+                session_duration_ms: row.get::<_, i64>(14)? as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_tool_call_stats_since(
+        &self,
+        since: &str,
+    ) -> Result<Vec<ToolCallStats>, RayClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT tool_name,
+                    COUNT(*) as call_count,
+                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count,
+                    AVG(duration_ms) as avg_duration_ms
+             FROM tool_call_logs
+             WHERE timestamp > ?1
+             GROUP BY tool_name
+             ORDER BY call_count DESC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok(ToolCallStats {
+                tool_name: row.get(0)?,
+                call_count: row.get::<_, i64>(1)? as u64,
+                success_count: row.get::<_, i64>(2)? as u64,
+                avg_duration_ms: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 1: Skill activations & generation log
+    // ------------------------------------------------------------------
+
+    pub fn insert_skill_activation(
+        &self,
+        chat_id: i64,
+        skill_name: &str,
+        success: bool,
+        tokens_used: u64,
+        duration_ms: u64,
+        timestamp: &str,
+    ) -> Result<i64, RayClawError> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO skill_activations (chat_id, skill_name, success, tokens_used, duration_ms, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                chat_id,
+                skill_name,
+                success as i32,
+                tokens_used as i64,
+                duration_ms as i64,
+                timestamp,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_skill_health_since(&self, since: &str) -> Result<Vec<SkillHealthRow>, RayClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT skill_name,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as ok,
+                    AVG(tokens_used) as avg_tokens,
+                    AVG(duration_ms) as avg_dur,
+                    MAX(timestamp) as last_at,
+                    MIN(timestamp) as first_at
+             FROM skill_activations
+             WHERE timestamp > ?1
+             GROUP BY skill_name
+             ORDER BY total DESC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok(SkillHealthRow {
+                skill_name: row.get(0)?,
+                total_activations: row.get::<_, i64>(1)? as u64,
+                successful_activations: row.get::<_, i64>(2)? as u64,
+                avg_tokens: row.get(3)?,
+                avg_duration_ms: row.get(4)?,
+                last_activated_at: row.get(5)?,
+                first_activated_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_tool_call_sequences_since(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<Vec<ToolCallSequence>, RayClawError> {
+        let conn = self.lock_conn();
+        // Get per-session tool sequences by grouping on session_metric_id
+        // Fall back to per-chat grouping with timestamp windows for older data
+        let mut stmt = conn.prepare(
+            "SELECT chat_id, tool_name FROM tool_call_logs
+             WHERE timestamp > ?1
+             ORDER BY chat_id, timestamp ASC
+             LIMIT ?2",
+        )?;
+        let mut sequences: Vec<ToolCallSequence> = Vec::new();
+        let mut current_chat_id: Option<i64> = None;
+        let mut current_tools: Vec<String> = Vec::new();
+        let rows = stmt.query_map(params![since, limit as i64 * 50], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (cid, tool_name) = row?;
+            if current_chat_id != Some(cid) {
+                if let Some(prev_cid) = current_chat_id {
+                    if current_tools.len() >= 3 {
+                        sequences.push(ToolCallSequence {
+                            chat_id: prev_cid,
+                            tool_names: std::mem::take(&mut current_tools),
+                        });
+                    } else {
+                        current_tools.clear();
+                    }
+                }
+                current_chat_id = Some(cid);
+            }
+            current_tools.push(tool_name);
+        }
+        // Flush last
+        if let Some(cid) = current_chat_id {
+            if current_tools.len() >= 3 {
+                sequences.push(ToolCallSequence {
+                    chat_id: cid,
+                    tool_names: current_tools,
+                });
+            }
+        }
+        sequences.truncate(limit);
+        Ok(sequences)
+    }
+
+    pub fn pattern_already_processed(&self, pattern_hash: &str) -> Result<bool, RayClawError> {
+        let conn = self.lock_conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM skill_generation_log WHERE pattern_hash = ?1",
+            params![pattern_hash],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn log_pattern_processed(
+        &self,
+        pattern_hash: &str,
+        skill_name: &str,
+        status: &str,
+    ) -> Result<(), RayClawError> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO skill_generation_log (pattern_hash, skill_name, generated_at, status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                pattern_hash,
+                skill_name,
+                chrono::Utc::now().to_rfc3339(),
+                status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get/set a key-value pair in db_meta (used for throttling reflector sub-tasks).
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, RayClawError> {
+        let conn = self.lock_conn();
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT value FROM db_meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), RayClawError> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO db_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }
 

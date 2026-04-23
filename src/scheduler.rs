@@ -12,6 +12,7 @@ use crate::channel::{
 use crate::db::call_blocking;
 use crate::llm_types::{Message, MessageContent, ResponseContentBlock};
 use crate::runtime::AppState;
+use crate::skill_evolution;
 use crate::text::floor_char_boundary;
 use crate::{db::Memory, memory_quality};
 
@@ -293,11 +294,466 @@ pub fn spawn_reflector(state: Arc<AppState>) {
     });
 }
 
+async fn aggregate_session_metrics(state: &Arc<AppState>) {
+    let lookback_secs = (state.config.reflector_interval_mins * 2 * 60) as i64;
+    let since = (Utc::now() - chrono::Duration::seconds(lookback_secs)).to_rfc3339();
+
+    let since_for_sessions = since.clone();
+    let session_stats = match call_blocking(state.db.clone(), move |db| {
+        db.get_session_metrics_since(&since_for_sessions, 500)
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Reflector: failed to aggregate session metrics: {e}");
+            return;
+        }
+    };
+
+    if session_stats.is_empty() {
+        return;
+    }
+
+    let total_sessions = session_stats.len();
+    let loop_count = session_stats.iter().filter(|s| s.loop_detected).count();
+    let overflow_count = session_stats
+        .iter()
+        .filter(|s| s.overflow_recovered)
+        .count();
+    let total_corrections: u32 = session_stats.iter().map(|s| s.user_corrections).sum();
+    let avg_iterations: f64 = session_stats
+        .iter()
+        .map(|s| s.total_iterations as f64)
+        .sum::<f64>()
+        / total_sessions as f64;
+
+    info!(
+        "Reflector metrics: {} sessions, avg {:.1} iterations, {} loops, {} overflows, {} corrections",
+        total_sessions, avg_iterations, loop_count, overflow_count, total_corrections
+    );
+
+    // Tool call aggregation — flag tools with low success rates
+    let tool_stats = match call_blocking(state.db.clone(), move |db| {
+        db.get_tool_call_stats_since(&since)
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    for stat in &tool_stats {
+        if stat.call_count > 0 {
+            let success_rate = stat.success_count as f64 / stat.call_count as f64;
+            if success_rate < 0.5 {
+                info!(
+                    "Reflector: tool '{}' low success rate ({:.0}%, {} calls)",
+                    stat.tool_name,
+                    success_rate * 100.0,
+                    stat.call_count
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Skill evolution reflector helpers
+// ---------------------------------------------------------------------------
+
+/// Log skill health stats for all skills with recent activations.
+async fn aggregate_skill_health(state: &Arc<AppState>) {
+    let lookback_secs = (state.config.reflector_interval_mins * 2 * 60) as i64;
+    let since = (Utc::now() - chrono::Duration::seconds(lookback_secs)).to_rfc3339();
+
+    let health_rows = match call_blocking(state.db.clone(), move |db| {
+        db.get_skill_health_since(&since)
+    })
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("Reflector: failed to aggregate skill health: {e}");
+            return;
+        }
+    };
+
+    if health_rows.is_empty() {
+        return;
+    }
+
+    for row in &health_rows {
+        let success_rate = row.successful_activations as f64 / row.total_activations.max(1) as f64;
+        info!(
+            "Skill health: '{}' — {} activations, {:.0}% success, avg {:.0} tokens",
+            row.skill_name,
+            row.total_activations,
+            success_rate * 100.0,
+            row.avg_tokens,
+        );
+    }
+}
+
+/// Detect repeated tool-call patterns and auto-generate candidate skills.
+/// Throttled to run at most every 6 hours via db_meta key.
+const SKILL_GEN_THROTTLE_KEY: &str = "last_skill_gen_run";
+const SKILL_GEN_INTERVAL_SECS: i64 = 6 * 3600;
+
+async fn detect_and_generate_skills(state: &Arc<AppState>) {
+    // Throttle check
+    let last_run = call_blocking(state.db.clone(), |db| db.get_meta(SKILL_GEN_THROTTLE_KEY))
+        .await
+        .ok()
+        .flatten();
+
+    if let Some(ts) = last_run {
+        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&ts) {
+            let elapsed = Utc::now().signed_duration_since(parsed).num_seconds();
+            if elapsed < SKILL_GEN_INTERVAL_SECS {
+                return;
+            }
+        }
+    }
+
+    // Mark as running
+    let now_str = Utc::now().to_rfc3339();
+    let _ = call_blocking(state.db.clone(), {
+        let now = now_str.clone();
+        move |db| db.set_meta(SKILL_GEN_THROTTLE_KEY, &now)
+    })
+    .await;
+
+    // Look back 7 days for patterns
+    let since = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+
+    let sequences = match call_blocking(state.db.clone(), move |db| {
+        db.get_tool_call_sequences_since(&since, 5000)
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Reflector: failed to get tool call sequences: {e}");
+            return;
+        }
+    };
+
+    if sequences.is_empty() {
+        return;
+    }
+
+    let patterns = skill_evolution::detect_patterns(&sequences, 3, 3);
+    info!(
+        "Reflector: detected {} candidate tool patterns from {} sessions",
+        patterns.len(),
+        sequences.len()
+    );
+
+    for pattern in patterns.iter().take(3) {
+        // Check if already processed
+        let hash = pattern.hash.clone();
+        let already = call_blocking(state.db.clone(), move |db| {
+            db.pattern_already_processed(&hash)
+        })
+        .await
+        .unwrap_or(true);
+
+        if already {
+            continue;
+        }
+
+        info!(
+            "Reflector: generating skill for pattern: {} ({}x)",
+            pattern.sequence.join(" -> "),
+            pattern.occurrences,
+        );
+
+        // Generate via LLM
+        let content =
+            match skill_evolution::generate_skill_content(state.llm.as_ref(), pattern).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Reflector: skill generation failed: {e}");
+                    let hash = pattern.hash.clone();
+                    let _ = call_blocking(state.db.clone(), move |db| {
+                        db.log_pattern_processed(&hash, "", "llm_error")
+                    })
+                    .await;
+                    continue;
+                }
+            };
+
+        // Validate
+        if let Err(e) = skill_evolution::validate_candidate_content(&content) {
+            info!("Reflector: generated skill failed validation: {e}");
+            let hash = pattern.hash.clone();
+            let _ = call_blocking(state.db.clone(), move |db| {
+                db.log_pattern_processed(&hash, "", "validation_failed")
+            })
+            .await;
+            continue;
+        }
+
+        // Extract name and write
+        let name = match skill_evolution::extract_skill_name(&content) {
+            Some(n) => n,
+            None => {
+                error!("Reflector: could not extract skill name from generated content");
+                let hash = pattern.hash.clone();
+                let _ = call_blocking(state.db.clone(), move |db| {
+                    db.log_pattern_processed(&hash, "", "no_name")
+                })
+                .await;
+                continue;
+            }
+        };
+
+        let skills_dir = state.skills.skills_dir().clone();
+        match skill_evolution::write_candidate_skill(&skills_dir, &name, &content) {
+            Ok(path) => {
+                info!(
+                    "Reflector: wrote candidate skill '{}' to {}",
+                    name,
+                    path.display()
+                );
+                let hash = pattern.hash.clone();
+                let skill_name = name.clone();
+                let _ = call_blocking(state.db.clone(), move |db| {
+                    db.log_pattern_processed(&hash, &skill_name, "created")
+                })
+                .await;
+
+                skill_evolution::append_learning(
+                    &state.config.data_dir,
+                    "skill_gen",
+                    &format!("Generated skill: {name}"),
+                    &format!(
+                        "Pattern: {} ({}x)",
+                        pattern.sequence.join("->"),
+                        pattern.occurrences
+                    ),
+                    "Auto-generated candidate skill from repeated tool pattern",
+                );
+            }
+            Err(e) => {
+                error!("Reflector: failed to write candidate skill: {e}");
+            }
+        }
+    }
+
+    // Check promotions for existing candidates
+    check_skill_promotions(state).await;
+}
+
+/// Check if any candidate skills should be promoted to verified.
+async fn check_skill_promotions(state: &Arc<AppState>) {
+    let since = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let health_rows = match call_blocking(state.db.clone(), move |db| {
+        db.get_skill_health_since(&since)
+    })
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+
+    let skills_dir = state.skills.skills_dir().clone();
+    for row in &health_rows {
+        if skill_evolution::should_promote(row) {
+            let candidate_path = skills_dir
+                .join("auto-generated")
+                .join(&row.skill_name)
+                .join("SKILL.md");
+            if !candidate_path.exists() {
+                continue;
+            }
+            // Only promote candidate-level skills
+            if let Ok(content) = std::fs::read_to_string(&candidate_path) {
+                if !content.contains("trust_level: candidate") {
+                    continue;
+                }
+            }
+            match skill_evolution::promote_skill(&skills_dir, &row.skill_name) {
+                Ok(()) => {
+                    info!(
+                        "Reflector: promoted skill '{}' to verified ({} activations, {:.0}% success)",
+                        row.skill_name,
+                        row.total_activations,
+                        row.successful_activations as f64 / row.total_activations as f64 * 100.0,
+                    );
+                    skill_evolution::append_learning(
+                        &state.config.data_dir,
+                        "skill_promote",
+                        &format!("Promoted skill: {}", row.skill_name),
+                        &format!(
+                            "{} activations, {:.0}% success rate",
+                            row.total_activations,
+                            row.successful_activations as f64 / row.total_activations as f64
+                                * 100.0,
+                        ),
+                        "Candidate proved reliable enough for promotion to verified",
+                    );
+                }
+                Err(e) => {
+                    error!("Reflector: failed to promote '{}': {e}", row.skill_name);
+                }
+            }
+        }
+    }
+}
+
+/// Identify stale (>30 days) and failing (<20% success) skills for retirement.
+async fn check_skill_retirements(state: &Arc<AppState>) {
+    // Look at all-time skill health (wider window for retirement decisions)
+    let since = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+    let health_rows = match call_blocking(state.db.clone(), move |db| {
+        db.get_skill_health_since(&since)
+    })
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+
+    let skills_dir = state.skills.skills_dir().clone();
+
+    for row in &health_rows {
+        // Only retire auto-generated skills
+        let auto_path = skills_dir
+            .join("auto-generated")
+            .join(&row.skill_name)
+            .join("SKILL.md");
+        if !auto_path.exists() {
+            continue;
+        }
+
+        let success_rate = row.successful_activations as f64 / row.total_activations.max(1) as f64;
+        let days_since_last =
+            if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&row.last_activated_at) {
+                Utc::now().signed_duration_since(last).num_days()
+            } else {
+                0
+            };
+
+        // Stale: unused for 30+ days with at least some history
+        if days_since_last > 30 {
+            info!(
+                "Reflector: retiring stale skill '{}' (last used {} days ago)",
+                row.skill_name, days_since_last
+            );
+            if let Err(e) = skill_evolution::archive_skill(
+                &skills_dir,
+                &row.skill_name,
+                &format!("stale: {} days unused", days_since_last),
+                Some(row),
+            ) {
+                error!(
+                    "Reflector: failed to archive stale skill '{}': {e}",
+                    row.skill_name
+                );
+            } else {
+                skill_evolution::append_learning(
+                    &state.config.data_dir,
+                    "skill_retire",
+                    &format!("Retired stale skill: {}", row.skill_name),
+                    &format!("Unused for {} days", days_since_last),
+                    "Auto-generated skills need regular use to stay active",
+                );
+            }
+            continue;
+        }
+
+        // Failing: <20% success with 5+ activations — try rewrite first, then archive
+        if success_rate < 0.20 && row.total_activations >= 5 {
+            info!(
+                "Reflector: skill '{}' failing ({:.0}% success, {} activations) — attempting rewrite",
+                row.skill_name,
+                success_rate * 100.0,
+                row.total_activations,
+            );
+
+            let current_content = match std::fs::read_to_string(&auto_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Try rewriting via LLM
+            match skill_evolution::rewrite_failing_skill(state.llm.as_ref(), &current_content, row)
+                .await
+            {
+                Ok(new_content) => {
+                    if skill_evolution::validate_candidate_content(&new_content).is_ok()
+                        && std::fs::write(&auto_path, &new_content).is_ok()
+                    {
+                        info!(
+                            "Reflector: rewrote failing skill '{}' — reset to candidate",
+                            row.skill_name
+                        );
+                        skill_evolution::append_learning(
+                            &state.config.data_dir,
+                            "skill_rewrite",
+                            &format!("Rewrote failing skill: {}", row.skill_name),
+                            &format!(
+                                "{:.0}% success over {} activations",
+                                success_rate * 100.0,
+                                row.total_activations
+                            ),
+                            "LLM-based rewrite attempted to fix failing skill",
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    error!("Reflector: rewrite failed for '{}': {e}", row.skill_name);
+                }
+            }
+
+            // Rewrite failed or invalid — archive it
+            if let Err(e) = skill_evolution::archive_skill(
+                &skills_dir,
+                &row.skill_name,
+                &format!(
+                    "failing: {:.0}% success after {} activations",
+                    success_rate * 100.0,
+                    row.total_activations
+                ),
+                Some(row),
+            ) {
+                error!(
+                    "Reflector: failed to archive failing skill '{}': {e}",
+                    row.skill_name
+                );
+            } else {
+                skill_evolution::append_learning(
+                    &state.config.data_dir,
+                    "skill_retire",
+                    &format!("Retired failing skill: {}", row.skill_name),
+                    &format!(
+                        "{:.0}% success over {} activations, rewrite failed",
+                        success_rate * 100.0,
+                        row.total_activations
+                    ),
+                    "Skill archived after LLM rewrite attempt also failed validation",
+                );
+            }
+        }
+    }
+}
+
 async fn run_reflector(state: &Arc<AppState>) {
     #[cfg(feature = "sqlite-vec")]
     backfill_embeddings(state).await;
 
     let _ = call_blocking(state.db.clone(), move |db| db.archive_stale_memories(30)).await;
+
+    // Phase 0: Aggregate session metrics
+    aggregate_session_metrics(state).await;
+
+    // Phase 1: Skill evolution
+    aggregate_skill_health(state).await;
+    detect_and_generate_skills(state).await;
+    check_skill_retirements(state).await;
 
     let lookback_secs = (state.config.reflector_interval_mins * 2 * 60) as i64;
     let since = (Utc::now() - chrono::Duration::seconds(lookback_secs)).to_rfc3339();

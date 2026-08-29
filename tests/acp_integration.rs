@@ -96,6 +96,22 @@ fn mock_agent_path() -> String {
     format!("{manifest}/tests/mock_acp_agent.py")
 }
 
+/// Platform-appropriate Python 3 interpreter.
+/// `python3` on Windows is often a non-functional Microsoft Store alias stub;
+/// the `py` launcher is the reliable entry point there.
+fn python_command() -> &'static str {
+    if cfg!(windows) {
+        "py"
+    } else {
+        "python3"
+    }
+}
+
+/// A workspace directory that exists on every platform.
+fn test_workspace() -> String {
+    std::env::temp_dir().to_string_lossy().into_owned()
+}
+
 /// Build an AcpManager configured to use the mock agent.
 fn mock_manager() -> AcpManager {
     let mut agents = std::collections::HashMap::new();
@@ -103,10 +119,10 @@ fn mock_manager() -> AcpManager {
         "mock".to_string(),
         AcpAgentConfig {
             launch: "binary".to_string(),
-            command: "python3".to_string(),
+            command: python_command().to_string(),
             args: vec![mock_agent_path()],
             env: std::collections::HashMap::new(),
-            workspace: Some("/tmp".to_string()),
+            workspace: Some(test_workspace()),
             auto_approve: Some(true),
             mode: "acp".to_string(),
             resource_limits: None,
@@ -416,13 +432,13 @@ fn mock_manager_error_mode() -> AcpManager {
         "mock-error".to_string(),
         AcpAgentConfig {
             launch: "binary".to_string(),
-            command: "python3".to_string(),
+            command: python_command().to_string(),
             args: vec![mock_agent_path()],
             env: std::collections::HashMap::from([(
                 "ACP_MOCK_MODE".to_string(),
                 "error".to_string(),
             )]),
-            workspace: Some("/tmp".to_string()),
+            workspace: Some(test_workspace()),
             auto_approve: Some(true),
             mode: "acp".to_string(),
             resource_limits: None,

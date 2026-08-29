@@ -9,6 +9,7 @@ use tracing::warn;
 
 /// Wait for any termination signal: SIGTERM, SIGHUP, or Ctrl-C.
 /// Returns a human-readable label of which signal was received.
+#[cfg(unix)]
 async fn shutdown_signal() -> &'static str {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -20,6 +21,15 @@ async fn shutdown_signal() -> &'static str {
         _ = sigterm.recv() => "SIGTERM",
         _ = sighup.recv() => "SIGHUP",
     }
+}
+
+/// Windows has no SIGTERM/SIGHUP; Ctrl-C is the only termination signal.
+#[cfg(windows)]
+async fn shutdown_signal() -> &'static str {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for Ctrl-C");
+    "Ctrl-C"
 }
 
 use crate::channel_adapter::ChannelRegistry;
